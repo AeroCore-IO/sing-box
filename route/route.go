@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -26,6 +27,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
+
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/exp/slices"
 )
@@ -369,6 +372,35 @@ func (r *Router) matchRule(
 			metadata.UDPDisableDomainUnmapping = true
 		}
 		metadata.InboundOptions = option.InboundOptions{}
+	}
+
+	if !preMatch {
+		provider := service.FromContext[AeroCoreDecisionProvider](ctx)
+		if provider == nil {
+			// Some inbounds may pass a per-connection context that doesn't carry the
+			// global service registry. Fall back to the router's base context.
+			provider = service.FromContext[AeroCoreDecisionProvider](r.ctx)
+		}
+		if provider == nil {
+			// Final fallback for embedded deployments.
+			provider = getAeroCoreDecisionProvider()
+		}
+		if provider != nil {
+			decision, decisionErr := provider.DecideRoute(ctx, metadata)
+			if decisionErr != nil {
+				r.logger.ErrorContext(ctx, "aerocore route decision failed: ", decisionErr)
+			} else if decision != nil {
+				if decision.Reject {
+					fatalErr = &R.RejectedError{Cause: syscall.ECONNREFUSED}
+					return
+				}
+				if decision.Outbound != "" {
+					selectedRule = &aeroCoreRule{action: &R.RuleActionRoute{Outbound: decision.Outbound}}
+					selectedRuleIndex = -1
+					return
+				}
+			}
+		}
 	}
 
 match:
