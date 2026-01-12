@@ -28,6 +28,7 @@ type Manager struct {
 	stage                   adapter.StartStage
 	outbounds               []adapter.Outbound
 	outboundByTag           map[string]adapter.Outbound
+	staleOutbounds          []adapter.Outbound
 	dependByTag             map[string][]string
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
@@ -166,7 +167,9 @@ func (m *Manager) Close() error {
 	}
 	m.started = false
 	outbounds := m.outbounds
+	staleOutbounds := m.staleOutbounds
 	m.outbounds = nil
+	m.staleOutbounds = nil
 	m.access.Unlock()
 	var err error
 	for _, outbound := range outbounds {
@@ -174,6 +177,15 @@ func (m *Manager) Close() error {
 			monitor.Start("close outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 			err = E.Append(err, closer.Close(), func(err error) error {
 				return E.Cause(err, "close outbound/", outbound.Type(), "[", outbound.Tag(), "]")
+			})
+			monitor.Finish()
+		}
+	}
+	for _, outbound := range staleOutbounds {
+		if closer, isCloser := outbound.(io.Closer); isCloser {
+			monitor.Start("close stale outbound/", outbound.Type(), "[", outbound.Tag(), "]")
+			err = E.Append(err, closer.Close(), func(err error) error {
+				return E.Cause(err, "close stale outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 			})
 			monitor.Finish()
 		}
@@ -266,12 +278,25 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	m.access.Lock()
 	defer m.access.Unlock()
 	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsOutbound)
-			if err != nil {
-				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
+		// Remove dependency bookkeeping for the replaced outbound to prevent
+		// dependByTag from accumulating duplicate entries across updates.
+		existsDependencies := existsOutbound.Dependencies()
+		for _, dependency := range existsDependencies {
+			entries := m.dependByTag[dependency]
+			if len(entries) == 1 {
+				if entries[0] == tag {
+					delete(m.dependByTag, dependency)
+				}
+				continue
+			}
+			m.dependByTag[dependency] = common.Filter(entries, func(it string) bool {
+				return it != tag
+			})
+			if len(m.dependByTag[dependency]) == 0 {
+				delete(m.dependByTag, dependency)
 			}
 		}
+
 		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 			return it == existsOutbound
 		})
@@ -279,6 +304,14 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			panic("invalid inbound index")
 		}
 		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
+
+		// Critical behavior for long-lived flows (e.g. games): do NOT close the
+		// old outbound immediately when replacing it at runtime. Closing it would
+		// tear down active connections that were established using that outbound.
+		// We keep it around and close it when the manager closes.
+		if m.started {
+			m.staleOutbounds = append(m.staleOutbounds, existsOutbound)
+		}
 	}
 	m.outbounds = append(m.outbounds, outbound)
 	m.outboundByTag[tag] = outbound
