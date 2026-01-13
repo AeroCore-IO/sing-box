@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -476,6 +477,13 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.InboundOptions = t.inboundOptions
 	t.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+
+	reporter := route.GetTrafficStatsReporter()
+	if reporter != nil {
+		conn = newTrackedTCPConn(conn, "tcp", source.TCPAddr(), destination.TCPAddr(), reporter, onClose)
+		onClose = nil
+	}
+
 	t.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -490,6 +498,13 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.InboundOptions = t.inboundOptions
 	t.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	t.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
+
+	reporter := route.GetTrafficStatsReporter()
+	if reporter != nil {
+		conn = newTrackedPacketConn(conn, "udp", source.UDPAddr(), destination.UDPAddr(), reporter, onClose)
+		onClose = nil
+	}
+
 	t.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -506,5 +521,12 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	metadata.InboundOptions = t.inboundOptions
 	t.logger.InfoContext(ctx, "inbound redirect connection from ", metadata.Source)
 	t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+
+	reporter := route.GetTrafficStatsReporter()
+	if reporter != nil {
+		conn = newTrackedTCPConn(conn, "tcp", source.TCPAddr(), destination.TCPAddr(), reporter, onClose)
+		onClose = nil
+	}
+
 	t.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }

@@ -1,0 +1,101 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"sync"
+
+	"github.com/sagernet/sing-box/route"
+)
+
+// ExampleTrafficReporter is a simple implementation of TrafficStatsReporter
+// that logs traffic statistics to the console and tracks cumulative statistics.
+type ExampleTrafficReporter struct {
+	mu    sync.Mutex
+	stats map[string]*connStats
+}
+
+type connStats struct {
+	upload   int64
+	download int64
+}
+
+func NewExampleTrafficReporter() *ExampleTrafficReporter {
+	return &ExampleTrafficReporter{
+		stats: make(map[string]*connStats),
+	}
+}
+
+func (r *ExampleTrafficReporter) OnConnectionStart(protocol, srcAddr, dstAddr string) {
+	connID := route.MakeConnectionID(protocol, srcAddr, dstAddr)
+	
+	r.mu.Lock()
+	r.stats[connID] = &connStats{}
+	r.mu.Unlock()
+	
+	log.Printf("[START] %s connection: %s -> %s", protocol, srcAddr, dstAddr)
+}
+
+func (r *ExampleTrafficReporter) OnPacket(protocol, direction, srcAddr, dstAddr string, bytes int) {
+	connID := route.MakeConnectionID(protocol, srcAddr, dstAddr)
+	
+	r.mu.Lock()
+	stats, exists := r.stats[connID]
+	if exists {
+		if direction == "tx" {
+			stats.upload += int64(bytes)
+		} else if direction == "rx" {
+			stats.download += int64(bytes)
+		}
+	}
+	r.mu.Unlock()
+	
+	// Uncomment to log every packet (warning: very verbose!)
+	// log.Printf("[PACKET] %s %s: %s -> %s: %d bytes", protocol, direction, srcAddr, dstAddr, bytes)
+}
+
+func (r *ExampleTrafficReporter) OnConnectionEnd(protocol, srcAddr, dstAddr string) {
+	connID := route.MakeConnectionID(protocol, srcAddr, dstAddr)
+	
+	r.mu.Lock()
+	stats, exists := r.stats[connID]
+	if exists {
+		log.Printf("[END] %s: %s -> %s: ↑%s ↓%s",
+			protocol, srcAddr, dstAddr,
+			formatBytes(stats.upload),
+			formatBytes(stats.download),
+		)
+		delete(r.stats, connID)
+	}
+	r.mu.Unlock()
+}
+
+func (r *ExampleTrafficReporter) UpdateMetadata(connID string, metadata map[string]interface{}) {
+	log.Printf("[METADATA] %s: %v", connID, metadata)
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// Example usage in your application startup code:
+func setupTrafficReporter() {
+	reporter := NewExampleTrafficReporter()
+	route.SetTrafficStatsReporter(reporter)
+	log.Println("Traffic reporter registered")
+}
+
+// To disable tracking:
+func disableTrafficReporter() {
+	route.SetTrafficStatsReporter(nil)
+	log.Println("Traffic reporter disabled")
+}
