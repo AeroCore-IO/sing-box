@@ -12,7 +12,7 @@ icon: material/new-box
 ```json
 {
   "type": "hysteria2",
-  "tag": "hy2-out",
+  "tag": "overlay-out",
   
   "server": "127.0.0.1",
   "server_port": 1080,
