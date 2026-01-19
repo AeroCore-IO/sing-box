@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync/atomic"
 
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/tls"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -27,6 +28,7 @@ func NewHTTPSTransportWrapper(dialer tls.Dialer, serverAddr M.Socksaddr) *HTTPST
 	return &HTTPSTransportWrapper{
 		http2Transport: &http2.Transport{
 			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.STDConfig) (net.Conn, error) {
+				ctx = interrupt.ContextWithIsExternalConnection(ctx)
 				tlsConn, err := dialer.DialTLSContext(ctx, serverAddr)
 				if err != nil {
 					return nil, err
@@ -42,6 +44,7 @@ func NewHTTPSTransportWrapper(dialer tls.Dialer, serverAddr M.Socksaddr) *HTTPST
 		},
 		httpTransport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				ctx = interrupt.ContextWithIsExternalConnection(ctx)
 				return dialer.DialTLSContext(ctx, serverAddr)
 			},
 		},

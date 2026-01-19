@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -103,6 +104,7 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 		headers:          headers,
 		transport: &http3.Transport{
 			Dial: func(ctx context.Context, addr string, tlsCfg *tls.STDConfig, cfg *quic.Config) (quic.EarlyConnection, error) {
+				ctx = interrupt.ContextWithIsExternalConnection(ctx)
 				conn, dialErr := transportDialer.DialContext(ctx, N.NetworkUDP, serverAddr)
 				if dialErr != nil {
 					return nil, dialErr
