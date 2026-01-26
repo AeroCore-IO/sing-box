@@ -20,6 +20,7 @@ type Hysteria2InboundOptions struct {
 	InboundTLSOptionsContainer
 	Masquerade  *Hysteria2Masquerade `json:"masquerade,omitempty"`
 	BrutalDebug bool                 `json:"brutal_debug,omitempty"`
+	Auth        *Hysteria2Auth       `json:"auth,omitempty"`
 }
 
 type Hysteria2Obfs struct {
@@ -30,6 +31,11 @@ type Hysteria2Obfs struct {
 type Hysteria2User struct {
 	Name     string `json:"name,omitempty"`
 	Password string `json:"password,omitempty"`
+}
+
+type Hysteria2Auth struct {
+	Type string `json:"type,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 type _Hysteria2Masquerade struct {

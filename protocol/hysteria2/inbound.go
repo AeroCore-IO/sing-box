@@ -1,7 +1,9 @@
 package hysteria2
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -19,6 +21,7 @@ import (
 	"github.com/sagernet/sing-quic/hysteria2"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -30,12 +33,11 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router       adapter.Router
-	logger       log.ContextLogger
-	listener     *listener.Listener
-	tlsConfig    tls.ServerConfig
-	service      *hysteria2.Service[int]
-	userNameList []string
+	router    adapter.Router
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	tlsConfig tls.ServerConfig
+	service   *hysteria2.Service[string]
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -113,7 +115,18 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	service, err := hysteria2.NewService[int](hysteria2.ServiceOptions{
+	var authenticator hysteria2.Authenticator
+	if options.Auth != nil && options.Auth.Type == C.Hysteria2AuthTypeHTTP {
+		authenticator = &httpAuthenticator{
+			url: options.Auth.URL,
+			client: &http.Client{
+				Timeout: C.TCPTimeout,
+			},
+			logger: logger,
+			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024)),
+		}
+	}
+	service, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
 		Context:               ctx,
 		Logger:                logger,
 		BrutalDebug:           options.BrutalDebug,
@@ -125,21 +138,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		UDPTimeout:            udpTimeout,
 		Handler:               inbound,
 		MasqueradeHandler:     masqueradeHandler,
+		Authenticator:         authenticator,
 	})
 	if err != nil {
 		return nil, err
 	}
-	userList := make([]int, 0, len(options.Users))
-	userNameList := make([]string, 0, len(options.Users))
+	userList := make([]string, 0, len(options.Users))
 	userPasswordList := make([]string, 0, len(options.Users))
-	for index, user := range options.Users {
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
+	for _, user := range options.Users {
+		userList = append(userList, user.Name)
 		userPasswordList = append(userPasswordList, user.Password)
 	}
 	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
-	inbound.userNameList = userNameList
 	return inbound, nil
 }
 
@@ -156,10 +167,10 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
-		metadata.User = userName
-		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+	userID, _ := auth.UserFromContext[string](ctx)
+	if userID != "" {
+		metadata.User = userID
+		h.logger.InfoContext(ctx, "[", userID, "] inbound connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
@@ -179,10 +190,10 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
-		metadata.User = userName
-		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+	userID, _ := auth.UserFromContext[string](ctx)
+	if userID != "" {
+		metadata.User = userID
+		h.logger.InfoContext(ctx, "[", userID, "] inbound packet connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
 	}
@@ -212,4 +223,52 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		common.PtrOrNil(h.service),
 	)
+}
+
+type cachedAuthResult struct {
+	id string
+	ok bool
+}
+
+type httpAuthenticator struct {
+	url    string
+	client *http.Client
+	logger log.ContextLogger
+	cache  *cache.LruCache[string, cachedAuthResult]
+}
+
+func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (string, bool) {
+	if result, ok := a.cache.Load(auth); ok {
+		return result.id, result.ok
+	}
+	request := map[string]any{
+		"addr": addr,
+		"auth": auth,
+		"tx":   tx,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", false
+	}
+	resp, err := a.client.Post(a.url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		a.logger.Error("http auth error: ", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		a.logger.Error("http auth status error: ", resp.Status)
+		return "", false
+	}
+	var response struct {
+		OK bool   `json:"ok"`
+		ID string `json:"id"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	if err != nil {
+		a.logger.Error("http auth response error: ", err)
+		return "", false
+	}
+	a.cache.StoreWithExpire(auth, cachedAuthResult{response.ID, response.OK}, time.Now().Add(time.Minute))
+	return response.ID, response.OK
 }
