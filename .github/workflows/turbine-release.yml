@@ -22,7 +22,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: AeroCore-IO/sing-quic
-          token: ${{ secrets.GH_PAT }}
           ref: feature-http-auth
           path: sing-quic
 
