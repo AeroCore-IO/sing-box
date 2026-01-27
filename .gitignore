@@ -18,3 +18,5 @@
 CLAUDE.md
 AGENTS.md
 /.claude/
+certificate.crt
+private.key
