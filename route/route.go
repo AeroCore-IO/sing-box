@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,23 @@ import (
 
 	"golang.org/x/exp/slices"
 )
+
+var (
+	// RFC 2544 benchmarking range (commonly used by FakeIP implementations).
+	rfc2544IPv4Prefix = netip.MustParsePrefix("198.18.0.0/15")
+	// Rate-limit noisy repeated warnings (nanoseconds since unix epoch).
+	lastRFC2544LeakWarnAt int64
+)
+
+func shouldWarnRFC2544Leak(now time.Time) bool {
+	last := atomic.LoadInt64(&lastRFC2544LeakWarnAt)
+	// Warn at most once every 2 seconds globally.
+	if last != 0 && now.UnixNano()-last < int64(2*time.Second) {
+		return false
+	}
+	atomic.StoreInt64(&lastRFC2544LeakWarnAt, now.UnixNano())
+	return true
+}
 
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
@@ -315,6 +333,25 @@ func (r *Router) matchRule(
 			metadata.ProcessInfo = processInfo
 		}
 	}
+		// High-signal: seeing RFC2544-range destinations (198.18.0.0/15) on a node that
+		// can't unmap them strongly indicates FakeIP leakage from an upstream client.
+		// This warning triggers even if FakeIP isn't configured/enabled locally.
+		if metadata.Destination.Addr.IsValid() && metadata.Destination.IsIPv4() && rfc2544IPv4Prefix.Contains(metadata.Destination.Addr) {
+			fakeIPTransport := r.dnsTransport.FakeIP()
+			canUnmapHere := fakeIPTransport != nil && fakeIPTransport.Store() != nil && fakeIPTransport.Store().Contains(metadata.Destination.Addr)
+			if !canUnmapHere && shouldWarnRFC2544Leak(time.Now()) {
+				r.logger.WarnContext(ctx,
+					"destination is in 198.18.0.0/15 (likely FakeIP) but local instance cannot unmap; check client-side DNS+TUN handling: ",
+					"destination=", metadata.Destination,
+					", inbound=", metadata.Inbound,
+					", inbound_type=", metadata.InboundType,
+					", network=", metadata.Network,
+					", source=", metadata.Source,
+					", domain=", metadata.Domain,
+					", process=", metadata.ProcessInfo,
+				)
+			}
+		}
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
 		if !loaded {
