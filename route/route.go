@@ -16,8 +16,8 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	R "github.com/sagernet/sing-box/route/rule"
-	"github.com/sagernet/sing-mux"
-	"github.com/sagernet/sing-vmess"
+	mux "github.com/sagernet/sing-mux"
+	vmess "github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -318,7 +318,24 @@ func (r *Router) matchRule(
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
 		if !loaded {
-			fatalErr = E.New("missing fakeip record, try enable `experimental.cache_file`")
+			// High-signal diagnostic for FakeIP leakage/cache loss:
+			// We are seeing a destination inside the configured FakeIP range, but the
+			// local FakeIP store has no mapping for it. This typically means:
+			// - DNS queries did not go through this sing-box instance's FakeIP DNS, or
+			// - the FakeIP store was reset (process restart without cache_file), or
+			// - traffic bypassed the local TUN/sing-box routing path.
+			r.logger.WarnContext(ctx,
+				"fakeip destination has no local mapping (FakeIP leakage or store reset): ",
+				"destination=", metadata.Destination,
+				", inbound=", metadata.Inbound,
+				", inbound_type=", metadata.InboundType,
+				", network=", metadata.Network,
+				", source=", metadata.Source,
+				", domain=", metadata.Domain,
+				", process=", metadata.ProcessInfo,
+				", note=try enable experimental.cache_file or ensure DNS+TUN are handled locally",
+			)
+			fatalErr = E.New("missing fakeip record (destination in fakeip range but unmapped); try enable `experimental.cache_file`")
 			return
 		}
 		if domain != "" {
