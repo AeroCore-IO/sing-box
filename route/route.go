@@ -338,7 +338,20 @@ func (r *Router) matchRule(
 			fatalErr = E.New("missing fakeip record (destination in fakeip range but unmapped); try enable `experimental.cache_file`")
 			return
 		}
-		if domain != "" {
+		if domain == "" {
+			// If the store reports a hit but returns an empty domain, we cannot unmap.
+			// This shouldn't normally happen; keep it high-signal for debugging.
+			r.logger.WarnContext(ctx,
+				"fakeip destination mapping is empty (cannot unmap): ",
+				"destination=", metadata.Destination,
+				", inbound=", metadata.Inbound,
+				", inbound_type=", metadata.InboundType,
+				", network=", metadata.Network,
+				", source=", metadata.Source,
+				", domain=", metadata.Domain,
+				", process=", metadata.ProcessInfo,
+			)
+		} else {
 			metadata.OriginDestination = metadata.Destination
 			metadata.Destination = M.Socksaddr{
 				Fqdn: domain,
