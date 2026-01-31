@@ -2,8 +2,10 @@ package log
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -109,14 +111,90 @@ type observableLogger struct {
 	tag string
 }
 
+func safeArgsToString(args []any) (s string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s = fallbackArgsToString(args, r)
+		}
+	}()
+	return F.ToString(args...)
+}
+
+func fallbackArgsToString(args []any, panicValue any) string {
+	var b strings.Builder
+	b.WriteString("log_format_panic=")
+	b.WriteString(fmt.Sprint(panicValue))
+
+	// sing-box often passes: ["message", "key=", value, "key=", value, ...]
+	// or sometimes a mix of strings/structs. Keep it readable.
+	start := 0
+	if len(args) > 0 {
+		if s, ok := args[0].(string); ok {
+			// Heuristic: if it looks like a sentence (spaces/colon), treat as message.
+			if strings.ContainsAny(s, " :,") && !strings.HasSuffix(strings.TrimSpace(s), "=") {
+				b.WriteString(" msg=")
+				b.WriteString(s)
+				start = 1
+			}
+		}
+	}
+
+	sanitizeKey := func(k string) (string, bool) {
+		k = strings.TrimSpace(k)
+		k = strings.TrimRight(k, ",")
+		k = strings.TrimRight(k, "=")
+		k = strings.TrimSpace(k)
+		if k == "" {
+			return "", false
+		}
+		// Disallow keys that look like full sentences.
+		if strings.Contains(k, " ") {
+			return "", false
+		}
+		return k, true
+	}
+
+	// Try to preserve key/value semantics when possible.
+	if (len(args)-start)%2 == 0 {
+		okKV := true
+		for i := start; i < len(args); i += 2 {
+			keyRaw, ok := args[i].(string)
+			if !ok {
+				okKV = false
+				break
+			}
+			if _, valid := sanitizeKey(keyRaw); !valid {
+				okKV = false
+				break
+			}
+		}
+		if okKV {
+			for i := start; i < len(args); i += 2 {
+				keyRaw := args[i].(string)
+				key, _ := sanitizeKey(keyRaw)
+				b.WriteString(" ")
+				b.WriteString(key)
+				b.WriteString("=")
+				b.WriteString(fmt.Sprint(args[i+1]))
+			}
+			return b.String()
+		}
+	}
+
+	b.WriteString(" args=")
+	b.WriteString(fmt.Sprint(args))
+	return b.String()
+}
+
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
 	if level > l.level {
 		return
 	}
+	argsString := safeArgsToString(args)
 	nowTime := time.Now()
 	if l.needObservable {
-		message, messageSimple := l.formatter.FormatWithSimple(ctx, level, l.tag, F.ToString(args...), nowTime)
+		message, messageSimple := l.formatter.FormatWithSimple(ctx, level, l.tag, argsString, nowTime)
 		if level == LevelPanic {
 			panic(message)
 		}
@@ -126,7 +204,7 @@ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 		}
 		l.subscriber.Emit(Entry{level, messageSimple})
 	} else {
-		message := l.formatter.Format(ctx, level, l.tag, F.ToString(args...), nowTime)
+		message := l.formatter.Format(ctx, level, l.tag, argsString, nowTime)
 		if level == LevelPanic {
 			panic(message)
 		}
@@ -136,7 +214,7 @@ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 		}
 	}
 	if l.platformWriter != nil {
-		l.platformWriter.WriteMessage(level, l.platformFormatter.Format(ctx, level, l.tag, F.ToString(args...), nowTime))
+		l.platformWriter.WriteMessage(level, l.platformFormatter.Format(ctx, level, l.tag, argsString, nowTime))
 	}
 }
 
