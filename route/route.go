@@ -252,7 +252,11 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
 	if metadata.FakeIP {
-		conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
+		if fakeIPTransport := r.dnsTransport.FakeIP(); fakeIPTransport != nil && fakeIPTransport.Store() != nil {
+			conn = newFakeIPRewritePacketConn(ctx, conn, fakeIPTransport.Store(), r.dns)
+		} else {
+			conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
+		}
 	}
 	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandlerEx); isHandler {
 		outboundHandler.NewPacketConnectionEx(ctx, conn, metadata, onClose)
