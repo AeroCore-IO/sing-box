@@ -3,12 +3,9 @@ package route
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,33 +32,6 @@ import (
 
 	"golang.org/x/exp/slices"
 )
-
-var (
-	// RFC 2544 benchmarking range (commonly used by FakeIP implementations).
-	rfc2544IPv4Prefix = netip.MustParsePrefix("198.18.0.0/15")
-	// Rate-limit noisy repeated warnings (nanoseconds since unix epoch).
-	lastRFC2544LeakWarnAt int64
-)
-
-const envDropRFC2544Egress = "AEROCORE_DROP_RFC2544_EGRESS"
-
-func dropRFC2544Enabled() bool {
-	v := strings.TrimSpace(os.Getenv(envDropRFC2544Egress))
-	if v == "" {
-		return false
-	}
-	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
-}
-
-func shouldWarnRFC2544Leak(now time.Time) bool {
-	last := atomic.LoadInt64(&lastRFC2544LeakWarnAt)
-	// Warn at most once every 2 seconds globally.
-	if last != 0 && now.UnixNano()-last < int64(2*time.Second) {
-		return false
-	}
-	atomic.StoreInt64(&lastRFC2544LeakWarnAt, now.UnixNano())
-	return true
-}
 
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
@@ -345,115 +315,21 @@ func (r *Router) matchRule(
 			metadata.ProcessInfo = processInfo
 		}
 	}
-	// High-signal: seeing RFC2544-range destinations (198.18.0.0/15) on a node that
-	// can't unmap them strongly indicates FakeIP leakage from an upstream client.
-	// This warning triggers even if FakeIP isn't configured/enabled locally.
-	if metadata.Destination.Addr.IsValid() && metadata.Destination.IsIPv4() && rfc2544IPv4Prefix.Contains(metadata.Destination.Addr) {
-		fakeIPTransport := r.dnsTransport.FakeIP()
-		canUnmapHere := fakeIPTransport != nil && fakeIPTransport.Store() != nil && fakeIPTransport.Store().Contains(metadata.Destination.Addr)
-		if !canUnmapHere && shouldWarnRFC2544Leak(time.Now()) {
-			r.logger.WarnContext(ctx, fmt.Sprintf(
-				"destination is in 198.18.0.0/15 (likely FakeIP) but local instance cannot unmap; check client-side DNS+TUN handling: destination=%v inbound=%s inbound_type=%s network=%s source=%v domain=%q process=%v",
-				metadata.Destination,
-				metadata.Inbound,
-				metadata.InboundType,
-				metadata.Network,
-				metadata.Source,
-				metadata.Domain,
-				metadata.ProcessInfo,
-			))
-		}
-	}
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
-		if !loaded {
-			// High-signal diagnostic for FakeIP leakage/cache loss:
-			// We are seeing a destination inside the configured FakeIP range, but the
-			// local FakeIP store has no mapping for it. This typically means:
-			// - DNS queries did not go through this sing-box instance's FakeIP DNS, or
-			// - the FakeIP store was reset (process restart without cache_file), or
-			// - traffic bypassed the local TUN/sing-box routing path.
-			r.logger.WarnContext(ctx, fmt.Sprintf(
-				"fakeip destination has no local mapping (FakeIP leakage or store reset): destination=%v inbound=%s inbound_type=%s network=%s source=%v domain=%q process=%v note=try enable experimental.cache_file or ensure DNS+TUN are handled locally",
-				metadata.Destination,
-				metadata.Inbound,
-				metadata.InboundType,
-				metadata.Network,
-				metadata.Source,
-				metadata.Domain,
-				metadata.ProcessInfo,
-			))
-			fatalErr = E.New("missing fakeip record (destination in fakeip range but unmapped); try enable `experimental.cache_file`")
-			return
-		}
-		if domain == "" {
-			// If the store reports a hit but returns an empty domain, we cannot unmap.
-			// This shouldn't normally happen; keep it high-signal for debugging.
-			r.logger.WarnContext(ctx, fmt.Sprintf(
-				"fakeip destination mapping is empty (cannot unmap): destination=%v inbound=%s inbound_type=%s network=%s source=%v domain=%q process=%v",
-				metadata.Destination,
-				metadata.Inbound,
-				metadata.InboundType,
-				metadata.Network,
-				metadata.Source,
-				metadata.Domain,
-				metadata.ProcessInfo,
-			))
-		} else {
+		if loaded && domain != "" {
 			metadata.OriginDestination = metadata.Destination
 			metadata.Destination = M.Socksaddr{
 				Fqdn: domain,
 				Port: metadata.Destination.Port,
 			}
 			metadata.FakeIP = true
-			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
 		}
 	} else if metadata.Domain == "" {
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
 		if loaded {
 			metadata.Domain = domain
 			r.logger.DebugContext(ctx, "found reserve mapped domain: ", metadata.Domain)
-		}
-	}
-
-	// Debug safety valve: if RFC2544 egress drop is enabled, reject any connection/packet
-	// that still targets 198.18.0.0/15 AFTER unmapping attempts. This prevents stale FakeIP
-	// destinations (e.g., apps caching 198.19.x.y across restarts) from being forwarded to
-	// an overlay server.
-	if dropRFC2544Enabled() {
-		if metadata.Destination.Addr.IsValid() && metadata.Destination.IsIPv4() && rfc2544IPv4Prefix.Contains(metadata.Destination.Addr) {
-			if shouldWarnRFC2544Leak(time.Now()) {
-				r.logger.WarnContext(ctx, fmt.Sprintf(
-					"dropping RFC2544/FakeIP destination because AEROCORE_DROP_RFC2544_EGRESS is enabled: destination=%v inbound=%s inbound_type=%s network=%s source=%v domain=%q process=%v",
-					metadata.Destination,
-					metadata.Inbound,
-					metadata.InboundType,
-					metadata.Network,
-					metadata.Source,
-					metadata.Domain,
-					metadata.ProcessInfo,
-				))
-			}
-			fatalErr = &R.RejectedError{Cause: syscall.ECONNREFUSED}
-			return
-		}
-		for _, addr := range metadata.DestinationAddresses {
-			if addr.IsValid() && rfc2544IPv4Prefix.Contains(addr) {
-				if shouldWarnRFC2544Leak(time.Now()) {
-					r.logger.WarnContext(ctx, fmt.Sprintf(
-						"dropping RFC2544/FakeIP destination address because AEROCORE_DROP_RFC2544_EGRESS is enabled: destination=%v destination_address=%v inbound=%s network=%s source=%v domain=%q process=%v",
-						metadata.Destination,
-						addr,
-						metadata.Inbound,
-						metadata.Network,
-						metadata.Source,
-						metadata.Domain,
-						metadata.ProcessInfo,
-					))
-				}
-				fatalErr = &R.RejectedError{Cause: syscall.ECONNREFUSED}
-				return
-			}
 		}
 	}
 	if metadata.Destination.IsIPv4() {
