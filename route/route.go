@@ -252,8 +252,14 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
 	if metadata.FakeIP {
-		if fakeIPTransport := r.dnsTransport.FakeIP(); fakeIPTransport != nil && fakeIPTransport.Store() != nil {
-			conn = newFakeIPRewritePacketConn(ctx, conn, fakeIPTransport.Store(), r.dns)
+		// Per-packet FakeIP rewrite is optional. When disabled, we fall back to NAT-style
+		// packet conn wrapping (legacy behavior).
+		if r.udpPerPacketFakeIP {
+			if fakeIPTransport := r.dnsTransport.FakeIP(); fakeIPTransport != nil && fakeIPTransport.Store() != nil {
+				conn = newFakeIPRewritePacketConn(ctx, conn, fakeIPTransport.Store(), r.dns)
+			} else {
+				conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
+			}
 		} else {
 			conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 		}

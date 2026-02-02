@@ -9,6 +9,14 @@ type RouteOptions struct {
 	RuleSet                    []RuleSet                         `json:"rule_set,omitempty"`
 	Final                      string                            `json:"final,omitempty"`
 	FindProcess                bool                              `json:"find_process,omitempty"`
+	// UDPPerPacketFakeIP enables per-packet FakeIP destination rewrite for UDP.
+	//
+	// When enabled and FakeIP store is available, sing-box will rewrite outgoing UDP
+	// packet destinations from FakeIP (RFC2544 198.18/15) to the real IP resolved
+	// client-side, and rewrite responses back to FakeIP.
+	//
+	// Default: false (disabled).
+	UDPPerPacketFakeIP         bool                              `json:"udp_per_packet_fakeip,omitempty"`
 	AutoDetectInterface        bool                              `json:"auto_detect_interface,omitempty"`
 	OverrideAndroidVPN         bool                              `json:"override_android_vpn,omitempty"`
 	DefaultInterface           string                            `json:"default_interface,omitempty"`

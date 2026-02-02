@@ -32,6 +32,7 @@ type Router struct {
 	network           adapter.NetworkManager
 	rules             []adapter.Rule
 	needFindProcess   bool
+	udpPerPacketFakeIP bool
 	ruleSets          []adapter.RuleSet
 	ruleSetMap        map[string]adapter.RuleSet
 	processSearcher   process.Searcher
@@ -55,6 +56,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
 		ruleSetMap:        make(map[string]adapter.RuleSet),
 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
+		udpPerPacketFakeIP: options.UDPPerPacketFakeIP,
 		pauseManager:      service.FromContext[pause.Manager](ctx),
 		platformInterface: service.FromContext[platform.Interface](ctx),
 		needWIFIState:     hasRule(options.Rules, isWIFIRule) || hasDNSRule(dnsOptions.Rules, isWIFIDNSRule),

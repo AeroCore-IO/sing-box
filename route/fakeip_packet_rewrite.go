@@ -29,13 +29,14 @@ type fakeIPRewritePacketConn struct {
 	N.PacketConn
 	store adapter.FakeIPStore
 	dns   adapter.DNSRouter
+	transport adapter.DNSTransport
 
 	mu         sync.Mutex
 	fakeToReal map[netip.Addr]netip.Addr
 	realToFake map[netip.Addr]netip.Addr
 }
 
-func newFakeIPRewritePacketConn(ctx context.Context, conn N.PacketConn, store adapter.FakeIPStore, dns adapter.DNSRouter) N.PacketConn {
+func newFakeIPRewritePacketConn(ctx context.Context, conn N.PacketConn, store adapter.FakeIPStore, dns adapter.DNSRouter, transport adapter.DNSTransport) N.PacketConn {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -44,6 +45,7 @@ func newFakeIPRewritePacketConn(ctx context.Context, conn N.PacketConn, store ad
 		PacketConn: conn,
 		store:      store,
 		dns:        dns,
+		transport:  transport,
 		fakeToReal: make(map[netip.Addr]netip.Addr, 256),
 		realToFake: make(map[netip.Addr]netip.Addr, 256),
 	}
@@ -81,7 +83,10 @@ func (c *fakeIPRewritePacketConn) ReadPacket(buffer *buf.Buffer) (destination M.
 	}
 
 	// Resolve domain -> real IP.
-	addrs, lookupErr := c.dns.Lookup(c.ctx, domain, adapter.DNSQueryOptions{Strategy: C.DomainStrategyPreferIPv4})
+	addrs, lookupErr := c.dns.Lookup(c.ctx, domain, adapter.DNSQueryOptions{
+		Transport: c.transport,
+		Strategy:  C.DomainStrategyPreferIPv4,
+	})
 	if lookupErr != nil || len(addrs) == 0 {
 		return destination, nil
 	}
