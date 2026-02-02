@@ -3,12 +3,12 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type RouteOptions struct {
-	GeoIP                      *GeoIPOptions                     `json:"geoip,omitempty"`
-	Geosite                    *GeositeOptions                   `json:"geosite,omitempty"`
-	Rules                      []Rule                            `json:"rules,omitempty"`
-	RuleSet                    []RuleSet                         `json:"rule_set,omitempty"`
-	Final                      string                            `json:"final,omitempty"`
-	FindProcess                bool                              `json:"find_process,omitempty"`
+	GeoIP       *GeoIPOptions   `json:"geoip,omitempty"`
+	Geosite     *GeositeOptions `json:"geosite,omitempty"`
+	Rules       []Rule          `json:"rules,omitempty"`
+	RuleSet     []RuleSet       `json:"rule_set,omitempty"`
+	Final       string          `json:"final,omitempty"`
+	FindProcess bool            `json:"find_process,omitempty"`
 	// UDPPerPacketFakeIP enables per-packet FakeIP destination rewrite for UDP.
 	//
 	// When enabled and FakeIP store is available, sing-box will rewrite outgoing UDP

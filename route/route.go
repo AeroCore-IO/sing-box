@@ -256,7 +256,15 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		// packet conn wrapping (legacy behavior).
 		if r.udpPerPacketFakeIP {
 			if fakeIPTransport := r.dnsTransport.FakeIP(); fakeIPTransport != nil && fakeIPTransport.Store() != nil {
-				conn = newFakeIPRewritePacketConn(ctx, conn, fakeIPTransport.Store(), r.dns)
+				// Important: resolve the real IP using a real DNS transport.
+				// If we let the DNS router pick transports/rules, we may get FakeIP answers
+				// again, resulting in no rewrite and packets going to RFC2544 addresses.
+				defaultTransport := r.dnsTransport.Default()
+				if defaultTransport != nil {
+					conn = newFakeIPRewritePacketConn(ctx, conn, fakeIPTransport.Store(), r.dns, defaultTransport)
+				} else {
+					conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
+				}
 			} else {
 				conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 			}
