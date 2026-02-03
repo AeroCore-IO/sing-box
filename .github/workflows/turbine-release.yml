@@ -39,7 +39,7 @@ jobs:
       - name: Build binaries
         working-directory: sing-box
         run: |
-          make ci_build
+          make ci_build TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api,with_grpc"
 
       - name: Release
         uses: softprops/action-gh-release@v1
