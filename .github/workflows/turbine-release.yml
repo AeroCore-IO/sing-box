@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# --------------------------------------------------
+# Changelog:
+#   - hysteria2 protocol added http auth support
+#   - v2ray api ignore users, default to all users
+# --------------------------------------------------
 jobs:
   release:
     runs-on: ubuntu-latest
