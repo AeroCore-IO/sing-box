@@ -22,6 +22,7 @@ jobs:
         with:
           ref: feature-http-auth
           path: sing-box
+          fetch-depth: 0
 
       - name: Check sing-quic
         uses: actions/checkout@v4
