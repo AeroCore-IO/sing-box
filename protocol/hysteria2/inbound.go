@@ -33,11 +33,12 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router    adapter.Router
-	logger    log.ContextLogger
-	listener  *listener.Listener
-	tlsConfig tls.ServerConfig
-	service   *hysteria2.Service[string]
+	router             adapter.Router
+	logger             log.ContextLogger
+	listener           *listener.Listener
+	tlsConfig          tls.ServerConfig
+	service            *hysteria2.Service[string]
+	userBandwidthStore *userBandwidthStore
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -99,9 +100,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 	}
 	inbound := &Inbound{
-		Adapter: inbound.NewAdapter(C.TypeHysteria2, tag),
-		router:  router,
-		logger:  logger,
+		Adapter:            inbound.NewAdapter(C.TypeHysteria2, tag),
+		router:             router,
+		logger:             logger,
+		userBandwidthStore: newUserBandwidthStore(),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
@@ -124,6 +126,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			},
 			logger: logger,
 			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024)),
+			onAuthResult: func(userID string, upKbps *int, downKbps *int) {
+				inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
+			},
 		}
 	}
 	service, err := hysteria2.NewService[string](hysteria2.ServiceOptions{
@@ -148,6 +153,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	for _, user := range options.Users {
 		userList = append(userList, user.Name)
 		userPasswordList = append(userPasswordList, user.Password)
+		inbound.userBandwidthStore.SetFixed(user.Name, user.UpKbps, user.DownKbps)
 	}
 	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
@@ -174,6 +180,9 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
+	if userLimit := h.userBandwidthStore.Load(userID); userLimit.enabled() {
+		conn = newRateLimitConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
+	}
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -196,6 +205,9 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		h.logger.InfoContext(ctx, "[", userID, "] inbound packet connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
+	}
+	if userLimit := h.userBandwidthStore.Load(userID); userLimit.enabled() {
+		conn = newRateLimitPacketConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
 	}
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
@@ -226,19 +238,26 @@ func (h *Inbound) Close() error {
 }
 
 type cachedAuthResult struct {
-	id string
-	ok bool
+	id       string
+	ok       bool
+	hasUp    bool
+	upKbps   int
+	hasDown  bool
+	downKbps int
 }
 
 type httpAuthenticator struct {
-	url    string
-	client *http.Client
-	logger log.ContextLogger
-	cache  *cache.LruCache[string, cachedAuthResult]
+	url          string
+	client       *http.Client
+	logger       log.ContextLogger
+	cache        *cache.LruCache[string, cachedAuthResult]
+	onAuthResult func(userID string, upKbps *int, downKbps *int)
 }
 
 func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (string, bool) {
-	if result, ok := a.cache.Load(auth); ok {
+	cacheKey := authCacheKey(addr, auth)
+	if result, ok := a.cache.Load(cacheKey); ok {
+		a.emitAuthResult(result)
 		return result.id, result.ok
 	}
 	request := map[string]any{
@@ -261,14 +280,45 @@ func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (s
 		return "", false
 	}
 	var response struct {
-		OK bool   `json:"ok"`
-		ID string `json:"id"`
+		OK       bool   `json:"ok"`
+		ID       string `json:"id"`
+		UpKbps   *int   `json:"up_kbps,omitempty"`
+		DownKbps *int   `json:"down_kbps,omitempty"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&response)
 	if err != nil {
 		a.logger.Error("http auth response error: ", err)
 		return "", false
 	}
-	a.cache.StoreWithExpire(auth, cachedAuthResult{response.ID, response.OK}, time.Now().Add(time.Minute))
+	result := cachedAuthResult{id: response.ID, ok: response.OK}
+	if response.UpKbps != nil {
+		result.hasUp = true
+		result.upKbps = *response.UpKbps
+	}
+	if response.DownKbps != nil {
+		result.hasDown = true
+		result.downKbps = *response.DownKbps
+	}
+	a.cache.StoreWithExpire(cacheKey, result, time.Now().Add(time.Minute))
+	a.emitAuthResult(result)
 	return response.ID, response.OK
+}
+
+func authCacheKey(addr string, auth string) string {
+	return addr + "\x00" + auth
+}
+
+func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
+	if a.onAuthResult == nil || !result.ok {
+		return
+	}
+	var upMbps *int
+	var downMbps *int
+	if result.hasUp {
+		upMbps = &result.upKbps
+	}
+	if result.hasDown {
+		downMbps = &result.downKbps
+	}
+	a.onAuthResult(result.id, upMbps, downMbps)
 }
