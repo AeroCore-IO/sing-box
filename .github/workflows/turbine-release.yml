@@ -21,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: feature-http-auth
+          ref: turbine
           path: sing-box
           fetch-depth: 0
 
@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: AeroCore-IO/sing-quic
-          ref: feature-http-auth
+          ref: turbine
           path: sing-quic
 
       - name: Set up Go
