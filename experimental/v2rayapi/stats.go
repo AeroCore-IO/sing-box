@@ -68,7 +68,7 @@ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, meta
 	var writeCounter []*atomic.Int64
 	countInbound := inbound != "" && s.inbounds[inbound]
 	countOutbound := outbound != "" && s.outbounds[outbound]
-	countUser := user != "" && s.users[user]
+	countUser := user != "" // && s.users[user] // Always count user traffic
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}
@@ -97,7 +97,7 @@ func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.Packet
 	var writeCounter []*atomic.Int64
 	countInbound := inbound != "" && s.inbounds[inbound]
 	countOutbound := outbound != "" && s.outbounds[outbound]
-	countUser := user != "" && s.users[user]
+	countUser := user != "" // && s.users[user] // Always count user traffic
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}
