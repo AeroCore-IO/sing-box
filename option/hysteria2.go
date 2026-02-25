@@ -31,6 +31,8 @@ type Hysteria2Obfs struct {
 type Hysteria2User struct {
 	Name     string `json:"name,omitempty"`
 	Password string `json:"password,omitempty"`
+	UpKbps   int    `json:"up_kbps,omitempty"`
+	DownKbps int    `json:"down_kbps,omitempty"`
 }
 
 type Hysteria2Auth struct {
