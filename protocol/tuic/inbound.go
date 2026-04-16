@@ -1,8 +1,11 @@
 package tuic
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -16,6 +19,7 @@ import (
 	"github.com/sagernet/sing-quic/tuic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -63,6 +67,17 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
+	var authenticator tuic.Authenticator
+	if options.Auth != nil && options.Auth.Type == C.TUICAuthTypeHTTP {
+		authenticator = &httpAuthenticator{
+			url: options.Auth.URL,
+			client: &http.Client{
+				Timeout: C.TCPTimeout,
+			},
+			logger: logger,
+			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024)),
+		}
+	}
 	service, err := tuic.NewService[int](tuic.ServiceOptions{
 		Context:           ctx,
 		Logger:            logger,
@@ -73,6 +88,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Heartbeat:         time.Duration(options.Heartbeat),
 		UDPTimeout:        udpTimeout,
 		Handler:           inbound,
+		Authenticator:     authenticator,
 	})
 	if err != nil {
 		return nil, err
@@ -167,4 +183,58 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		common.PtrOrNil(h.server),
 	)
+}
+
+type cachedAuthResult struct {
+	id string
+	ok bool
+}
+
+type httpAuthenticator struct {
+	url    string
+	client *http.Client
+	logger log.ContextLogger
+	cache  *cache.LruCache[string, cachedAuthResult]
+}
+
+func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (string, bool) {
+	cacheKey := authCacheKey(addr, auth)
+	if result, ok := a.cache.Load(cacheKey); ok {
+		return result.id, result.ok
+	}
+	request := map[string]any{
+		"addr": addr,
+		"auth": auth,
+		"tx":   tx,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", false
+	}
+	resp, err := a.client.Post(a.url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		a.logger.Error("http auth error: ", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		a.logger.Error("http auth status error: ", resp.Status)
+		return "", false
+	}
+	var response struct {
+		OK bool   `json:"ok"`
+		ID string `json:"id"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	if err != nil {
+		a.logger.Error("http auth response error: ", err)
+		return "", false
+	}
+	result := cachedAuthResult{id: response.ID, ok: response.OK}
+	a.cache.StoreWithExpire(cacheKey, result, time.Now().Add(time.Minute))
+	return response.ID, response.OK
+}
+
+func authCacheKey(addr string, auth string) string {
+	return addr + "\x00" + auth
 }

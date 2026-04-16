@@ -10,12 +10,18 @@ type TUICInboundOptions struct {
 	ZeroRTTHandshake  bool               `json:"zero_rtt_handshake,omitempty"`
 	Heartbeat         badoption.Duration `json:"heartbeat,omitempty"`
 	InboundTLSOptionsContainer
+	Auth *TUICAuth `json:"auth,omitempty"`
 }
 
 type TUICUser struct {
 	Name     string `json:"name,omitempty"`
 	UUID     string `json:"uuid,omitempty"`
 	Password string `json:"password,omitempty"`
+}
+
+type TUICAuth struct {
+	Type string `json:"type,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 type TUICOutboundOptions struct {
