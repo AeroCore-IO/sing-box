@@ -208,10 +208,29 @@ func (h *Inbound) Close() error {
 type cachedAuthResult struct {
 	id       string
 	ok       bool
+	password string
 	hasUp    bool
 	upKbps   int
 	hasDown  bool
 	downKbps int
+}
+
+func (r *cachedAuthResult) upKbpsPtr() *int {
+	if r.hasUp {
+		p := new(int)
+		*p = r.upKbps
+		return p
+	}
+	return nil
+}
+
+func (r *cachedAuthResult) downKbpsPtr() *int {
+	if r.hasDown {
+		p := new(int)
+		*p = r.downKbps
+		return p
+	}
+	return nil
 }
 
 type httpAuthenticator struct {
@@ -222,43 +241,44 @@ type httpAuthenticator struct {
 	onAuthResult func(userID string, upKbps *int, downKbps *int)
 }
 
-func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (string, bool) {
-	cacheKey := authCacheKey(addr, auth)
+func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int) {
+	cacheKey := authCacheKey(addr, uuid)
 	if result, ok := a.cache.Load(cacheKey); ok {
 		a.emitAuthResult(result)
-		return result.id, result.ok
+		return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
 	}
 	request := map[string]any{
-		"addr": addr,
-		"auth": auth,
-		"tx":   tx,
+		"addr":     addr,
+		"password": uuid,
+		"tx":       tx,
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
-		return "", false
+		return "", false, "", nil, nil
 	}
 	resp, err := a.client.Post(a.url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		a.logger.Error("http auth error: ", err)
-		return "", false
+		return "", false, "", nil, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		a.logger.Error("http auth status error: ", resp.Status)
-		return "", false
+		return "", false, "", nil, nil
 	}
 	var response struct {
 		OK       bool   `json:"ok"`
 		ID       string `json:"id"`
+		Password string `json:"password"`
 		UpKbps   *int   `json:"up_kbps,omitempty"`
 		DownKbps *int   `json:"down_kbps,omitempty"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&response)
 	if err != nil {
 		a.logger.Error("http auth response error: ", err)
-		return "", false
+		return "", false, "", nil, nil
 	}
-	result := cachedAuthResult{id: response.ID, ok: response.OK}
+	result := cachedAuthResult{id: response.ID, ok: response.OK, password: response.Password}
 	if response.UpKbps != nil {
 		result.hasUp = true
 		result.upKbps = *response.UpKbps
@@ -269,24 +289,16 @@ func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (s
 	}
 	a.cache.StoreWithExpire(cacheKey, result, time.Now().Add(time.Minute))
 	a.emitAuthResult(result)
-	return response.ID, response.OK
+	return response.ID, response.OK, response.Password, result.upKbpsPtr(), result.downKbpsPtr()
 }
 
 func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
 	if a.onAuthResult == nil || !result.ok {
 		return
 	}
-	var upKbps *int
-	var downKbps *int
-	if result.hasUp {
-		upKbps = &result.upKbps
-	}
-	if result.hasDown {
-		downKbps = &result.downKbps
-	}
-	a.onAuthResult(result.id, upKbps, downKbps)
+	a.onAuthResult(result.id, result.upKbpsPtr(), result.downKbpsPtr())
 }
 
-func authCacheKey(addr string, auth string) string {
-	return addr + "\x00" + auth
+func authCacheKey(addr string, uuid string) string {
+	return addr + "\x00" + uuid
 }
