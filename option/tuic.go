@@ -17,6 +17,8 @@ type TUICUser struct {
 	Name     string `json:"name,omitempty"`
 	UUID     string `json:"uuid,omitempty"`
 	Password string `json:"password,omitempty"`
+	UpKbps   int    `json:"up_kbps,omitempty"`
+	DownKbps int    `json:"down_kbps,omitempty"`
 }
 
 type TUICAuth struct {

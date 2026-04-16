@@ -302,10 +302,6 @@ func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (s
 	return response.ID, response.OK
 }
 
-func authCacheKey(addr string, auth string) string {
-	return addr + "\x00" + auth
-}
-
 func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
 	if a.onAuthResult == nil || !result.ok {
 		return
@@ -319,4 +315,8 @@ func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
 		downMbps = &result.downKbps
 	}
 	a.onAuthResult(result.id, upMbps, downMbps)
+}
+
+func authCacheKey(addr string, auth string) string {
+	return addr + "\x00" + auth
 }

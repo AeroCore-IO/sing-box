@@ -14,6 +14,7 @@ permissions:
 #   - v2ray api ignore users, default to all users
 #   - hysteria2 user bandwidth limiting added (fixed + dynamic token bucket at application layer)
 #   - tuic protocol added http auth support
+#   - tuic user bandwidth limiting added (fixed + dynamic token bucket at application layer)
 # --------------------------------------------------
 jobs:
   release:
