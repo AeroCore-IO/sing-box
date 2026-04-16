@@ -306,15 +306,15 @@ func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
 	if a.onAuthResult == nil || !result.ok {
 		return
 	}
-	var upMbps *int
-	var downMbps *int
+	var upKbps *int
+	var downKbps *int
 	if result.hasUp {
-		upMbps = &result.upKbps
+		upKbps = &result.upKbps
 	}
 	if result.hasDown {
-		downMbps = &result.downKbps
+		downKbps = &result.downKbps
 	}
-	a.onAuthResult(result.id, upMbps, downMbps)
+	a.onAuthResult(result.id, upKbps, downKbps)
 }
 
 func authCacheKey(addr string, auth string) string {
