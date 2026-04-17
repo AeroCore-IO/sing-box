@@ -248,9 +248,9 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 		return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
 	}
 	request := map[string]any{
-		"addr":     addr,
-		"password": uuid,
-		"tx":       tx,
+		"addr": addr,
+		"uuid": uuid,
+		"tx":   tx,
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
