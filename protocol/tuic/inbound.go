@@ -37,8 +37,7 @@ type Inbound struct {
 	logger             log.ContextLogger
 	listener           *listener.Listener
 	tlsConfig          tls.ServerConfig
-	server             *tuic.Service[int]
-	userNameList       []string
+	server             *tuic.Service[string]
 	userBandwidthStore *userBandwidthStore
 }
 
@@ -83,7 +82,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			},
 		}
 	}
-	service, err := tuic.NewService[int](tuic.ServiceOptions{
+	service, err := tuic.NewService[string](tuic.ServiceOptions{
 		Context:           ctx,
 		Logger:            logger,
 		TLSConfig:         tlsConfig,
@@ -98,27 +97,24 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	var userList []int
-	var userNameList []string
+	var userList []string
 	var userUUIDList [][16]byte
 	var userPasswordList []string
-	for index, user := range options.Users {
+	for _, user := range options.Users {
 		if user.UUID == "" {
-			return nil, E.New("missing uuid for user ", index)
+			return nil, E.New("missing uuid for user ", user.Name)
 		}
 		userUUID, err := uuid.FromString(user.UUID)
 		if err != nil {
-			return nil, E.Cause(err, "invalid uuid for user ", index)
+			return nil, E.Cause(err, "invalid uuid for user ", user.Name)
 		}
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
+		userList = append(userList, user.Name)
 		userUUIDList = append(userUUIDList, userUUID)
 		userPasswordList = append(userPasswordList, user.Password)
 		inbound.userBandwidthStore.SetFixed(user.Name, user.UpKbps, user.DownKbps)
 	}
 	service.UpdateUsers(userList, userUUIDList, userPasswordList)
 	inbound.server = service
-	inbound.userNameList = userNameList
 	return inbound, nil
 }
 
@@ -134,11 +130,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	var userName string
-	if userID >= 0 && userID < len(h.userNameList) {
-		userName = h.userNameList[userID]
-	}
+	userName, _ := auth.UserFromContext[string](ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
@@ -163,11 +155,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	var userName string
-	if userID >= 0 && userID < len(h.userNameList) {
-		userName = h.userNameList[userID]
-	}
+	userName, _ := auth.UserFromContext[string](ctx)
 	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
