@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -76,7 +77,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 				Timeout: C.TCPTimeout,
 			},
 			logger: logger,
-			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024)),
+			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024), cache.WithAge[string, cachedAuthResult](5)),
 			onAuthResult: func(userID string, upKbps *int, downKbps *int) {
 				inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
 			},
@@ -232,7 +233,6 @@ type httpAuthenticator struct {
 func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int) {
 	cacheKey := authCacheKey(addr, uuid)
 	if result, ok := a.cache.Load(cacheKey); ok {
-		a.emitAuthResult(result)
 		return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
 	}
 	request := map[string]any{
@@ -261,7 +261,7 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 		UpKbps   *int   `json:"up_kbps,omitempty"`
 		DownKbps *int   `json:"down_kbps,omitempty"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&response)
+	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&response)
 	if err != nil {
 		a.logger.Error("http auth response error: ", err)
 		return "", false, "", nil, nil
@@ -275,7 +275,7 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 		result.hasDown = true
 		result.downKbps = *response.DownKbps
 	}
-	a.cache.StoreWithExpire(cacheKey, result, time.Now().Add(time.Minute))
+	a.cache.Store(cacheKey, result)
 	a.emitAuthResult(result)
 	return response.ID, response.OK, response.Password, result.upKbpsPtr(), result.downKbpsPtr()
 }
