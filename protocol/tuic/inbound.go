@@ -20,7 +20,6 @@ import (
 	"github.com/sagernet/sing-quic/tuic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
-	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -77,7 +76,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 				Timeout: C.TCPTimeout,
 			},
 			logger: logger,
-			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024), cache.WithAge[string, cachedAuthResult](5)),
 			onAuthResult: func(userID string, upKbps *int, downKbps *int) {
 				inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
 			},
@@ -94,6 +92,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		UDPTimeout:        udpTimeout,
 		Handler:           inbound,
 		Authenticator:     authenticator,
+		OnAuthSuccess: func(userID string, upKbps *int, downKbps *int) {
+			inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -194,50 +195,14 @@ func (h *Inbound) Close() error {
 	)
 }
 
-type cachedAuthResult struct {
-	id       string
-	ok       bool
-	password string
-	hasUp    bool
-	upKbps   int
-	hasDown  bool
-	downKbps int
-}
-
-func (r *cachedAuthResult) upKbpsPtr() *int {
-	if r.hasUp {
-		p := new(int)
-		*p = r.upKbps
-		return p
-	}
-	return nil
-}
-
-func (r *cachedAuthResult) downKbpsPtr() *int {
-	if r.hasDown {
-		p := new(int)
-		*p = r.downKbps
-		return p
-	}
-	return nil
-}
-
 type httpAuthenticator struct {
 	url          string
 	client       *http.Client
 	logger       log.ContextLogger
-	cache        *cache.LruCache[string, cachedAuthResult]
 	onAuthResult func(userID string, upKbps *int, downKbps *int)
 }
 
 func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int) {
-	cacheKey := authCacheKey(addr, uuid)
-	if result, ok := a.cache.Load(cacheKey); ok {
-		if result.ok {
-			return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
-		}
-		a.cache.Delete(cacheKey)
-	}
 	request := map[string]any{
 		"addr": addr,
 		"uuid": uuid,
@@ -269,29 +234,8 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 		a.logger.Error("http auth response error: ", err)
 		return "", false, "", nil, nil
 	}
-	result := cachedAuthResult{id: response.ID, ok: response.OK, password: response.Password}
-	if response.UpKbps != nil {
-		result.hasUp = true
-		result.upKbps = *response.UpKbps
+	if response.OK && a.onAuthResult != nil {
+		a.onAuthResult(response.ID, response.UpKbps, response.DownKbps)
 	}
-	if response.DownKbps != nil {
-		result.hasDown = true
-		result.downKbps = *response.DownKbps
-	}
-	if response.OK {
-		a.cache.Store(cacheKey, result)
-	}
-	a.emitAuthResult(result)
-	return response.ID, response.OK, response.Password, result.upKbpsPtr(), result.downKbpsPtr()
-}
-
-func (a *httpAuthenticator) emitAuthResult(result cachedAuthResult) {
-	if a.onAuthResult == nil || !result.ok {
-		return
-	}
-	a.onAuthResult(result.id, result.upKbpsPtr(), result.downKbpsPtr())
-}
-
-func authCacheKey(addr string, uuid string) string {
-	return addr + "\x00" + uuid
+	return response.ID, response.OK, response.Password, response.UpKbps, response.DownKbps
 }
