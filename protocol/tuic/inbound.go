@@ -233,7 +233,10 @@ type httpAuthenticator struct {
 func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int) {
 	cacheKey := authCacheKey(addr, uuid)
 	if result, ok := a.cache.Load(cacheKey); ok {
-		return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
+		if result.ok {
+			return result.id, result.ok, result.password, result.upKbpsPtr(), result.downKbpsPtr()
+		}
+		a.cache.Delete(cacheKey)
 	}
 	request := map[string]any{
 		"addr": addr,
@@ -275,7 +278,9 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 		result.hasDown = true
 		result.downKbps = *response.DownKbps
 	}
-	a.cache.Store(cacheKey, result)
+	if response.OK {
+		a.cache.Store(cacheKey, result)
+	}
 	a.emitAuthResult(result)
 	return response.ID, response.OK, response.Password, result.upKbpsPtr(), result.downKbpsPtr()
 }
