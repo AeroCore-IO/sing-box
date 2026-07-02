@@ -1,0 +1,77 @@
+name: Preview Release Turbine sing-box
+
+on:
+  push:
+    tags:
+      - 'turbine-preview-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'sing-box branch, tag, or commit to build'
+        required: true
+        default: 'feat/turbine-session'
+      sing_quic_ref:
+        description: 'sing-quic branch, tag, or commit'
+        required: true
+        default: 'turbine'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve build ref
+        id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "sing_box_ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+            echo "sing_quic_ref=${{ github.event.inputs.sing_quic_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sing_box_ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+            echo "sing_quic_ref=turbine" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sing_box_ref }}
+          path: sing-box
+          fetch-depth: 0
+
+      - name: Check sing-quic
+        uses: actions/checkout@v4
+        with:
+          repository: AeroCore-IO/sing-quic
+          ref: ${{ steps.resolve.outputs.sing_quic_ref }}
+          path: sing-quic
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.9
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Build binaries
+        working-directory: sing-box
+        run: |
+          make ci_build TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api,with_grpc"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            sing-box/sing-box
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+
+      - name: Upload artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-preview-${{ github.event.inputs.ref }}
+          path: sing-box/sing-box
+          retention-days: 7

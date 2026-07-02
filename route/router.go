@@ -41,6 +41,7 @@ type Router struct {
 	processCache      freelru.Cache[processCacheKey, processCacheEntry]
 	pauseManager      pause.Manager
 	trackers          []adapter.ConnectionTracker
+	guards            []adapter.ConnectionGuard
 	platformInterface adapter.PlatformInterface
 	started           bool
 }
@@ -217,6 +218,10 @@ func (r *Router) Rules() []adapter.Rule {
 
 func (r *Router) AppendTracker(tracker adapter.ConnectionTracker) {
 	r.trackers = append(r.trackers, tracker)
+}
+
+func (r *Router) AppendGuard(guard adapter.ConnectionGuard) {
+	r.guards = append(r.guards, guard)
 }
 
 func (r *Router) NeedFindProcess() bool {

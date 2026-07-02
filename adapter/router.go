@@ -27,7 +27,13 @@ type Router interface {
 	Rules() []Rule
 	NeedFindProcess() bool
 	AppendTracker(tracker ConnectionTracker)
+	AppendGuard(guard ConnectionGuard)
 	ResetNetwork()
+}
+
+type ConnectionGuard interface {
+	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) (net.Conn, error)
+	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) (N.PacketConn, error)
 }
 
 type ConnectionTracker interface {

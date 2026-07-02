@@ -149,6 +149,13 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	for _, guard := range r.guards {
+		var guardErr error
+		conn, guardErr = guard.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+		if guardErr != nil {
+			return guardErr
+		}
+	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -274,6 +281,13 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	for _, buffer := range packetBuffers {
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
+	}
+	for _, guard := range r.guards {
+		var guardErr error
+		conn, guardErr = guard.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+		if guardErr != nil {
+			return guardErr
+		}
 	}
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)

@@ -366,6 +366,13 @@ func New(options Options) (*Box, error) {
 			service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
 		}
 	}
+	if turbineOptions := experimentalOptions.Turbine; turbineOptions != nil && turbineOptions.Enabled {
+		mockEnabled := turbineOptions.Mock != nil && turbineOptions.Mock.Enabled
+		if !mockEnabled && turbineOptions.ControlPlaneURL == "" {
+			return nil, E.New("experimental.turbine.control_plane_url is required")
+		}
+		router.AppendGuard(experimental.NewTurbineGuard(logFactory.NewLogger("turbine"), common.PtrValueOrDefault(turbineOptions)))
+	}
 	if ntpOptions.Enabled {
 		ntpDialer, err := dialer.New(ctx, ntpOptions.DialerOptions, ntpOptions.ServerIsDomain())
 		if err != nil {

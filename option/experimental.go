@@ -6,6 +6,7 @@ type ExperimentalOptions struct {
 	CacheFile *CacheFileOptions `json:"cache_file,omitempty"`
 	ClashAPI  *ClashAPIOptions  `json:"clash_api,omitempty"`
 	V2RayAPI  *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
+	Turbine   *TurbineOptions   `json:"turbine,omitempty"`
 	Debug     *DebugOptions     `json:"debug,omitempty"`
 }
 
