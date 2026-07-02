@@ -33,6 +33,9 @@ func NewGuard(logger logger.ContextLogger, options option.TurbineOptions) *Guard
 	var mock *mockStore
 	if store, ok := mockEnabled(options); ok {
 		mock = store
+		logger.Info("turbine guard enabled (mock mode)")
+	} else {
+		logger.Info("turbine guard enabled, control plane: ", options.ControlPlaneURL)
 	}
 	return &Guard{
 		logger:       logger,
@@ -90,15 +93,30 @@ func (g *Guard) shouldHandle(metadata adapter.InboundContext) bool {
 }
 
 func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (upKbps int, downKbps int, err error) {
+	target := connectionTarget(metadata)
 	domainName := destinationDomain(metadata)
 	if domainName != "" {
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine domain path ", target)
 		whitelist, loadErr := g.session.MergedWhitelist(ctx, metadata.User)
 		if loadErr != nil {
+			g.logger.InfoContext(ctx, "[", metadata.User, "] turbine block ", target, ": ", loadErr)
 			return 0, 0, E.Cause(loadErr, "turbine: load session whitelist")
 		}
-		return 0, 0, checkDomainWhitelist(domainName, whitelist)
+		if checkErr := checkDomainWhitelist(domainName, whitelist); checkErr != nil {
+			g.logger.InfoContext(ctx, "[", metadata.User, "] turbine block ", target, ": not in whitelist")
+			return 0, 0, checkErr
+		}
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine allow ", target, " (whitelist)")
+		return 0, 0, nil
 	}
-	upKbps, downKbps = g.confidence.Lookup(ctx, metadata, destinationIP(metadata))
+	ip := destinationIP(metadata)
+	g.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence path ", target)
+	upKbps, downKbps = g.confidence.Lookup(ctx, metadata, ip)
+	if upKbps > 0 || downKbps > 0 {
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine allow ", target, " rate up=", upKbps, " down=", downKbps)
+	} else {
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine allow ", target, " (no rate limit)")
+	}
 	return upKbps, downKbps, nil
 }
 
@@ -148,6 +166,9 @@ func (g *Guard) sniffStream(ctx context.Context, metadata *adapter.InboundContex
 		sniffBuffer.Release()
 		return nil, nil
 	}
+	if domain := destinationDomain(*metadata); domain != "" {
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine sniffed domain ", domain)
+	}
 	return sniffBuffer, nil
 }
 
@@ -190,6 +211,9 @@ func (g *Guard) sniffPacket(ctx context.Context, metadata *adapter.InboundContex
 		sniff.QUICClientHello,
 		sniff.DTLSRecord,
 	)
+	if domain := destinationDomain(*metadata); domain != "" {
+		g.logger.InfoContext(ctx, "[", metadata.User, "] turbine sniffed domain ", domain)
+	}
 	return bufio.NewCachedPacketConn(conn, sniffBuffer, destination), nil
 }
 
@@ -211,4 +235,14 @@ func destinationIP(metadata adapter.InboundContext) netip.Addr {
 		return metadata.DestinationAddresses[0]
 	}
 	return netip.Addr{}
+}
+
+func connectionTarget(metadata adapter.InboundContext) string {
+	if domain := destinationDomain(metadata); domain != "" {
+		return domain
+	}
+	if metadata.Destination.IsValid() {
+		return metadata.Destination.String()
+	}
+	return "unknown"
 }

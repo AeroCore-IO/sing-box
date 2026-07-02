@@ -77,8 +77,10 @@ func (c *ConfidenceClient) Lookup(ctx context.Context, metadata adapter.InboundC
 	}
 	cacheKey := ip.String()
 	if cached, ok := c.cache.Load(cacheKey); ok && time.Now().Before(cached.expiresAt) {
+		c.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence cache hit ip=", ip, " up=", cached.upKbps, " down=", cached.downKbps)
 		return cached.upKbps, cached.downKbps
 	}
+	c.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence cache miss ip=", ip)
 	result, err, _ := c.inflight.Do(cacheKey, func() (any, error) {
 		if cached, ok := c.cache.Load(cacheKey); ok && time.Now().Before(cached.expiresAt) {
 			return cachedConfidence{upKbps: cached.upKbps, downKbps: cached.downKbps}, nil
@@ -86,6 +88,7 @@ func (c *ConfidenceClient) Lookup(ctx context.Context, metadata adapter.InboundC
 		upKbps, downKbps, lookupErr := c.lookupRemote(ctx, metadata, ip)
 		if lookupErr != nil {
 			c.logger.WarnContext(ctx, "confidence lookup for ", ip, ": ", lookupErr)
+			c.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence default ip=", ip, " up=", c.defaultUpKbps, " down=", c.defaultDownKbps)
 			return cachedConfidence{upKbps: c.defaultUpKbps, downKbps: c.defaultDownKbps}, nil
 		}
 		c.cache.StoreWithExpire(cacheKey, cachedConfidence{
@@ -108,7 +111,7 @@ func (c *ConfidenceClient) lookupRemote(ctx context.Context, metadata adapter.In
 		if !loaded {
 			return c.defaultUpKbps, c.defaultDownKbps, nil
 		}
-		c.logger.DebugContext(ctx, "mock confidence for ", ip, ": ", confidence.confidence, ", up=", confidence.upKbps, " down=", confidence.downKbps)
+		c.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence mock ip=", ip, " confidence=", confidence.confidence, " up=", confidence.upKbps, " down=", confidence.downKbps)
 		return confidence.upKbps, confidence.downKbps, nil
 	}
 	requestBody, err := json.Marshal(map[string]any{
@@ -139,6 +142,6 @@ func (c *ConfidenceClient) lookupRemote(ctx context.Context, metadata adapter.In
 	if err != nil {
 		return 0, 0, err
 	}
-	c.logger.DebugContext(ctx, "confidence for ", ip, ": ", body.Confidence, ", up=", body.UpKbps, " down=", body.DownKbps)
+	c.logger.InfoContext(ctx, "[", metadata.User, "] turbine confidence ip=", ip, " confidence=", body.Confidence, " up=", body.UpKbps, " down=", body.DownKbps)
 	return body.UpKbps, body.DownKbps, nil
 }

@@ -95,6 +95,7 @@ func NewSessionClient(logger logger.ContextLogger, options option.TurbineOptions
 
 func (c *SessionClient) MergedWhitelist(ctx context.Context, user string) (*Whitelist, error) {
 	if cached, ok := c.mergedWhitelistCache.Load(user); ok && time.Now().Before(cached.expiresAt) {
+		c.logger.InfoContext(ctx, "[", user, "] turbine merged whitelist cache hit active_games=", cached.whitelist.HasActiveGames())
 		return cached.whitelist, nil
 	}
 	activeGames, err := c.activeGames(ctx, user)
@@ -102,6 +103,7 @@ func (c *SessionClient) MergedWhitelist(ctx context.Context, user string) (*Whit
 		return nil, err
 	}
 	if len(activeGames) == 0 {
+		c.logger.InfoContext(ctx, "[", user, "] turbine merged whitelist no active games")
 		whitelist := withActiveGames(&Whitelist{empty: true}, false)
 		c.storeMergedWhitelist(user, whitelist)
 		return whitelist, nil
@@ -121,6 +123,7 @@ func (c *SessionClient) MergedWhitelist(ctx context.Context, user string) (*Whit
 		return nil, err
 	}
 	whitelist = withActiveGames(whitelist, true)
+	c.logger.InfoContext(ctx, "[", user, "] turbine merged whitelist active_games=", len(activeGames), " empty=", whitelist.Empty())
 	c.storeMergedWhitelist(user, whitelist)
 	return whitelist, nil
 }
@@ -137,8 +140,10 @@ func (c *SessionClient) activeGames(ctx context.Context, user string) ([]string,
 		return c.mock.activeGames(user), nil
 	}
 	if cached, ok := c.sessionCache.Load(user); ok && time.Now().Before(cached.expiresAt) {
+		c.logger.InfoContext(ctx, "[", user, "] turbine session cache hit active_games=", len(cached.activeGames))
 		return cached.activeGames, nil
 	}
+	c.logger.InfoContext(ctx, "[", user, "] turbine session fetch")
 	requestURL := c.baseURL + c.sessionPath + "?" + url.Values{"user": {user}}.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
@@ -163,6 +168,7 @@ func (c *SessionClient) activeGames(ctx context.Context, user string) ([]string,
 		activeGames: body.ActiveGames,
 		expiresAt:   time.Now().Add(c.sessionCacheTTL),
 	}, time.Now().Add(c.sessionCacheTTL))
+	c.logger.InfoContext(ctx, "[", user, "] turbine session active_games=", len(body.ActiveGames))
 	return body.ActiveGames, nil
 }
 
@@ -175,8 +181,10 @@ func (c *SessionClient) gameWhitelist(ctx context.Context, gameID string) ([]str
 		return body.Domains, body.IPCIDRs, nil
 	}
 	if cached, ok := c.gameWhitelistCache.Load(gameID); ok && time.Now().Before(cached.expiresAt) {
+		c.logger.InfoContext(ctx, "turbine game whitelist cache hit game=", gameID, " domains=", len(cached.domains))
 		return cached.domains, cached.ipCIDRs, nil
 	}
+	c.logger.InfoContext(ctx, "turbine game whitelist fetch ", gameID)
 	path := strings.ReplaceAll(c.gameWhitelistPath, "{id}", url.PathEscape(gameID))
 	requestURL := c.baseURL + path
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
@@ -201,6 +209,7 @@ func (c *SessionClient) gameWhitelist(ctx context.Context, gameID string) ([]str
 		ipCIDRs:   body.IPCIDRs,
 		expiresAt: time.Now().Add(c.gameWhitelistCacheTTL),
 	}, time.Now().Add(c.gameWhitelistCacheTTL))
+	c.logger.InfoContext(ctx, "turbine game whitelist ", gameID, " domains=", len(body.Domains), " ip_cidrs=", len(body.IPCIDRs))
 	return body.Domains, body.IPCIDRs, nil
 }
 
