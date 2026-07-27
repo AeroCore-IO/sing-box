@@ -1,52 +1,57 @@
 package turbine
 
 import (
+	"context"
+	"net/netip"
+	"sync"
+
 	"github.com/sagernet/sing-box/option"
 )
 
 type mockStore struct {
-	sessions          map[string][]string
-	gameWhitelists    map[string]gameWhitelistResponse
-	confidenceByIP    map[string]mockConfidence
-	defaultConfidence *mockConfidence
-}
-
-type mockConfidence struct {
-	confidence float64
-	upKbps     int
-	downKbps   int
+	mu            sync.RWMutex
+	ownerSessions map[string]string
+	allows        map[string]*AllowSet
+	decisions     map[string]*IPDecision
 }
 
 func newMockStore(options *option.TurbineMockOptions) *mockStore {
-	store := &mockStore{
-		sessions:       make(map[string][]string),
-		gameWhitelists: make(map[string]gameWhitelistResponse),
-		confidenceByIP: make(map[string]mockConfidence),
+	s := &mockStore{
+		ownerSessions: make(map[string]string),
+		allows:        make(map[string]*AllowSet),
+		decisions:     make(map[string]*IPDecision),
 	}
-	for user, session := range options.Sessions {
-		store.sessions[user] = append([]string(nil), session.ActiveGames...)
+	if options == nil {
+		return s
 	}
-	for gameID, whitelist := range options.GameWhitelists {
-		store.gameWhitelists[gameID] = gameWhitelistResponse{
-			Domains: append([]string(nil), whitelist.Domains...),
-			IPCIDRs: append([]string(nil), whitelist.IPCIDRs...),
+	for owner, sessionID := range options.OwnerSessions {
+		s.ownerSessions[owner] = sessionID
+	}
+	for sessionID, allow := range options.Allows {
+		a := &AllowSet{
+			SessionID:   allow.SessionID,
+			Owner:       allow.Owner,
+			SteamAppIDs: append([]string(nil), allow.SteamAppIDs...),
+			UpdatedAt:   allow.UpdatedAt,
 		}
-	}
-	for ip, confidence := range options.Confidence {
-		store.confidenceByIP[ip] = mockConfidence{
-			confidence: confidence.Confidence,
-			upKbps:     confidence.UpKbps,
-			downKbps:   confidence.DownKbps,
+		if a.SessionID == "" {
+			a.SessionID = sessionID
 		}
+		s.allows[sessionID] = a
 	}
-	if options.DefaultConfidence != nil {
-		store.defaultConfidence = &mockConfidence{
-			confidence: options.DefaultConfidence.Confidence,
-			upKbps:     options.DefaultConfidence.UpKbps,
-			downKbps:   options.DefaultConfidence.DownKbps,
+	for ip, d := range options.Decisions {
+		dec := &IPDecision{
+			IP:         d.IP,
+			SteamAppID: d.SteamAppID,
+			Confidence: d.Confidence,
+			UpdatedAt:  d.UpdatedAt,
 		}
+		if dec.IP == "" {
+			dec.IP = ip
+		}
+		s.decisions[ip] = dec
 	}
-	return store
+	return s
 }
 
 func mockEnabled(options option.TurbineOptions) (*mockStore, bool) {
@@ -56,34 +61,58 @@ func mockEnabled(options option.TurbineOptions) (*mockStore, bool) {
 	return newMockStore(options.Mock), true
 }
 
-func (m *mockStore) activeGames(user string) []string {
-	if m == nil {
-		return nil
-	}
-	games, loaded := m.sessions[user]
-	if !loaded {
-		return nil
-	}
-	return append([]string(nil), games...)
+func (s *mockStore) GetOwnerSession(_ context.Context, owner string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ownerSessions[owner], nil
 }
 
-func (m *mockStore) gameWhitelist(gameID string) (gameWhitelistResponse, bool) {
-	if m == nil {
-		return gameWhitelistResponse{}, false
+func (s *mockStore) GetAllow(_ context.Context, sessionID string) (*AllowSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allow := s.allows[sessionID]
+	if allow == nil {
+		return nil, nil
 	}
-	whitelist, loaded := m.gameWhitelists[gameID]
-	return whitelist, loaded
+	cp := *allow
+	cp.SteamAppIDs = append([]string(nil), allow.SteamAppIDs...)
+	return &cp, nil
 }
 
-func (m *mockStore) confidence(ip string) (mockConfidence, bool) {
-	if m == nil {
-		return mockConfidence{}, false
+func (s *mockStore) GetDecision(_ context.Context, ip netip.Addr) (*IPDecision, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := s.decisions[canonicalizeIP(ip)]
+	if d == nil {
+		return nil, nil
 	}
-	if confidence, loaded := m.confidenceByIP[ip]; loaded {
-		return confidence, true
-	}
-	if m.defaultConfidence != nil {
-		return *m.defaultConfidence, true
-	}
-	return mockConfidence{}, false
+	cp := *d
+	return &cp, nil
+}
+
+func (s *mockStore) Close() error { return nil }
+
+// test helpers
+func (s *mockStore) setOwnerSession(owner, sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ownerSessions[owner] = sessionID
+}
+
+func (s *mockStore) setAllow(sessionID string, allow *AllowSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allows[sessionID] = allow
+}
+
+func (s *mockStore) deleteAllow(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.allows, sessionID)
+}
+
+func (s *mockStore) setDecision(ip string, d *IPDecision) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.decisions[ip] = d
 }

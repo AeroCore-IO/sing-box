@@ -368,8 +368,8 @@ func New(options Options) (*Box, error) {
 	}
 	if turbineOptions := experimentalOptions.Turbine; turbineOptions != nil && turbineOptions.Enabled {
 		mockEnabled := turbineOptions.Mock != nil && turbineOptions.Mock.Enabled
-		if !mockEnabled && turbineOptions.ControlPlaneURL == "" {
-			return nil, E.New("experimental.turbine.control_plane_url is required")
+		if !mockEnabled && (turbineOptions.Redis == nil || turbineOptions.Redis.Address == "") {
+			return nil, E.New("experimental.turbine.redis.address is required")
 		}
 		router.AppendGuard(experimental.NewTurbineGuard(logFactory.NewLogger("turbine"), common.PtrValueOrDefault(turbineOptions)))
 	}

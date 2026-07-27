@@ -2,225 +2,326 @@ package turbine
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"net/netip"
-	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/logger"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/stretchr/testify/require"
 )
 
 type testLogger struct{}
 
-func (testLogger) Trace(...any)                            {}
-func (testLogger) Debug(...any)                            {}
-func (testLogger) Info(...any)                             {}
-func (testLogger) Warn(...any)                             {}
-func (testLogger) Error(...any)                            {}
-func (testLogger) Fatal(...any)                            {}
-func (testLogger) Panic(...any)                            {}
-func (testLogger) TraceContext(context.Context, ...any)    {}
-func (testLogger) DebugContext(context.Context, ...any)    {}
-func (testLogger) InfoContext(context.Context, ...any)     {}
-func (testLogger) WarnContext(context.Context, ...any)     {}
-func (testLogger) ErrorContext(context.Context, ...any)   {}
-func (testLogger) FatalContext(context.Context, ...any)   {}
-func (testLogger) PanicContext(context.Context, ...any)   {}
+func (testLogger) Trace(args ...any)                             {}
+func (testLogger) Debug(args ...any)                             {}
+func (testLogger) Info(args ...any)                              {}
+func (testLogger) Warn(args ...any)                              {}
+func (testLogger) Error(args ...any)                             {}
+func (testLogger) Fatal(args ...any)                             {}
+func (testLogger) Panic(args ...any)                             {}
+func (testLogger) TraceContext(ctx context.Context, args ...any) {}
+func (testLogger) DebugContext(ctx context.Context, args ...any) {}
+func (testLogger) InfoContext(ctx context.Context, args ...any)  {}
+func (testLogger) WarnContext(ctx context.Context, args ...any)  {}
+func (testLogger) ErrorContext(ctx context.Context, args ...any) {}
+func (testLogger) FatalContext(ctx context.Context, args ...any) {}
+func (testLogger) PanicContext(ctx context.Context, args ...any) {}
 
-var _ logger.ContextLogger = testLogger{}
+func testGuard(mock *option.TurbineMockOptions) *Guard {
+	return NewGuard(testLogger{}, option.TurbineOptions{
+		Enabled:           true,
+		AllowPollInterval: badoption.Duration(50 * time.Millisecond),
+		UserStateIdleTTL:  badoption.Duration(time.Hour),
+		ThresholdT:        0.70,
+		HKDNSResolverIPs:  []string{"10.0.0.53"},
+		Blacklist:         []string{"9.9.9.9"},
+		Mock:              mock,
+	})
+}
 
-func TestConfidenceClientCache(t *testing.T) {
-	var requestCount atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		json.NewEncoder(w).Encode(map[string]any{
-			"confidence": 0.9,
-			"up_kbps":    1000,
-			"down_kbps":  2000,
-		})
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewConfidenceClient(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL: server.URL,
-		ConfidencePath:  "",
-	}, nil)
-	metadata := adapter.InboundContext{
-		User:        "alice",
-		Inbound:     "tuic-in",
-		InboundType: "tuic",
+func meta(user, ip string, port uint16) adapter.InboundContext {
+	addr := netip.MustParseAddr(ip)
+	return adapter.InboundContext{
+		User:        user,
+		InboundType: C.TypeHysteria2,
+		Destination: M.SocksaddrFrom(addr, port),
 	}
+}
+
+func waitAllow(t *testing.T, g *Guard, user, app string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if g.owners.InAllow(user, app) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("allow for %s/%s not loaded", user, app)
+}
+
+func TestEmptyAllowIsProxy(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		OwnerSessions: map[string]string{
+			"user1": "sess1",
+		},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {SessionID: "sess1", Owner: "user1", SteamAppIDs: nil},
+		},
+		Decisions: map[string]option.TurbineMockDecision{
+			"1.2.3.4": {IP: "1.2.3.4", SteamAppID: "1086940", Confidence: 0.9},
+		},
+	})
+	defer g.Close()
+	time.Sleep(100 * time.Millisecond)
+	action, err := g.evaluate(context.Background(), meta("user1", "1.2.3.4", 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != ActionProxy {
+		t.Fatalf("want proxy, got %s", action)
+	}
+}
+
+func TestHighAllowAcceleration(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		OwnerSessions: map[string]string{
+			"user1": "sess1",
+		},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {SessionID: "sess1", Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+		Decisions: map[string]option.TurbineMockDecision{
+			"1.2.3.4": {IP: "1.2.3.4", SteamAppID: "1086940", Confidence: 0.9},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "user1", "1086940")
+	action, err := g.evaluate(context.Background(), meta("user1", "1.2.3.4", 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != ActionAcceleration {
+		t.Fatalf("want acceleration, got %s", action)
+	}
+}
+
+func TestLowAllowRejected(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		OwnerSessions: map[string]string{
+			"user1": "sess1",
+		},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {SessionID: "sess1", Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+		Decisions: map[string]option.TurbineMockDecision{
+			"1.2.3.4": {IP: "1.2.3.4", SteamAppID: "1086940", Confidence: 0.4},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "user1", "1086940")
+	action, err := g.evaluate(context.Background(), meta("user1", "1.2.3.4", 443))
+	if !IsRejected(err) {
+		t.Fatalf("want rejected err, got action=%s err=%v", action, err)
+	}
+}
+
+func TestConfidenceZeroIsProxy(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"user1": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+		Decisions: map[string]option.TurbineMockDecision{
+			"1.2.3.4": {SteamAppID: "1086940", Confidence: 0},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "user1", "1086940")
+	action, err := g.evaluate(context.Background(), meta("user1", "1.2.3.4", 443))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("want proxy, got %s err=%v", action, err)
+	}
+}
+
+func TestOwnerMissingIsProxy(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{Enabled: true})
+	defer g.Close()
+	action, err := g.evaluate(context.Background(), meta("nobody", "1.2.3.4", 443))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("want proxy, got %s err=%v", action, err)
+	}
+}
+
+func TestBlacklistRejected(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{Enabled: true})
+	defer g.Close()
+	_, err := g.evaluate(context.Background(), meta("user1", "9.9.9.9", 443))
+	if !IsRejected(err) {
+		t.Fatalf("want rejected, got %v", err)
+	}
+}
+
+func TestDNSBypassSkipsDecision(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		Decisions: map[string]option.TurbineMockDecision{
+			"10.0.0.53": {SteamAppID: "1086940", Confidence: 0.4},
+		},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+		OwnerSessions: map[string]string{"user1": "sess1"},
+	})
+	defer g.Close()
+	// DNS bypass is handled before evaluate; evaluate on DNS dest would still run session path.
+	// Verify the guard entry path skips reject for LOW∧allow on DNS IP.
+	err := g.dnsBypassTCP(meta("user1", "10.0.0.53", 53))
+	if err != nil {
+		t.Fatalf("dns bypass should pass, err=%v", err)
+	}
+	if !g.isDNSBypass(meta("user1", "10.0.0.53", 53)) {
+		t.Fatal("expected dns bypass match")
+	}
+}
+
+func TestOwnerDriftClearsAllow(t *testing.T) {
+	mock := newMockStore(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"user1": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+	})
+	events := newSessionLogger(testLogger{})
+	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, 50, events)
+	defer om.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if om.InAllow("user1", "1086940") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !om.InAllow("user1", "1086940") {
+		t.Fatal("allow not loaded")
+	}
+	mock.setAllow("sess1", &AllowSet{SessionID: "sess1", Owner: "other", SteamAppIDs: []string{"1086940"}})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !om.InAllow("user1", "1086940") && om.SessionID("user1") == "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected owner_drift to clear session")
+}
+
+func TestPollFailKeepsSnapshot(t *testing.T) {
+	mock := newMockStore(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"user1": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "user1", SteamAppIDs: []string{"1086940"}},
+		},
+	})
+	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, 50, newSessionLogger(testLogger{}))
+	defer om.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if om.InAllow("user1", "1086940") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mock.deleteAllow("sess1")
+	time.Sleep(100 * time.Millisecond)
+	if !om.InAllow("user1", "1086940") {
+		t.Fatal("should keep snapshot after poll miss")
+	}
+}
+
+func TestRewriteEDNSSession(t *testing.T) {
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeA)
+	m.SetEdns0(1232, false)
+	raw, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, ok := rewriteEDNSSession(raw, 65001, "sess_abc")
+	if !ok {
+		t.Fatal("expected rewrite")
+	}
+	var parsed dns.Msg
+	if err := parsed.Unpack(out); err != nil {
+		t.Fatal(err)
+	}
+	opt := parsed.IsEdns0()
+	if opt == nil {
+		t.Fatal("missing OPT")
+	}
+	found := false
+	for _, o := range opt.Option {
+		if local, ok := o.(*dns.EDNS0_LOCAL); ok && local.Code == 65001 {
+			if string(local.Data) != "sess_abc" {
+				t.Fatalf("data=%s", local.Data)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("session option missing")
+	}
+	if _, ok := rewriteEDNSSession(out, 65001, ""); !ok {
+		t.Fatal("expected clear rewrite")
+	}
+}
+
+type flakyDecisionStore struct {
+	Store
+	fail bool
+}
+
+func (s *flakyDecisionStore) GetDecision(ctx context.Context, ip netip.Addr) (*IPDecision, error) {
+	if s.fail {
+		return nil, errors.New("redis down")
+	}
+	return s.Store.GetDecision(ctx, ip)
+}
+
+func TestDecisionFailKeepsSnapshot(t *testing.T) {
+	base := newMockStore(&option.TurbineMockOptions{
+		Enabled: true,
+		Decisions: map[string]option.TurbineMockDecision{
+			"1.2.3.4": {SteamAppID: "1086940", Confidence: 0.9},
+		},
+	})
+	store := &flakyDecisionStore{Store: base}
+	cache := newDecisionCache(testLogger{}, store, time.Minute, 30*time.Second, 5*time.Second, 0.70)
 	ip := netip.MustParseAddr("1.2.3.4")
-
-	up1, down1 := client.Lookup(context.Background(), metadata, ip)
-	up2, down2 := client.Lookup(context.Background(), metadata, ip)
-	require.Equal(t, 1000, up1)
-	require.Equal(t, 2000, down1)
-	require.Equal(t, up1, up2)
-	require.Equal(t, down1, down2)
-	require.Equal(t, int32(1), requestCount.Load())
-}
-
-func TestConfidenceClientFallback(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewConfidenceClient(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL: server.URL,
-		DefaultUpKbps:   100,
-		DefaultDownKbps: 500,
-	}, nil)
-	up, down := client.Lookup(context.Background(), adapter.InboundContext{User: "bob"}, netip.MustParseAddr("9.9.9.9"))
-	require.Equal(t, 100, up)
-	require.Equal(t, 500, down)
-}
-
-func TestSessionClientMergedWhitelist(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/session":
-			json.NewEncoder(w).Encode(map[string]any{"active_games": []string{"pubg"}})
-		case "/game/pubg/whitelist":
-			json.NewEncoder(w).Encode(map[string]any{
-				"domains":  []string{"*.pubg.com"},
-				"ip_cidrs": []string{"203.0.113.1"},
-			})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewSessionClient(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL:   server.URL,
-		SessionPath:       "/session",
-		GameWhitelistPath: "/game/{id}/whitelist",
-	}, nil)
-	whitelist, err := client.MergedWhitelist(context.Background(), "alice")
-	require.NoError(t, err)
-	require.True(t, whitelist.HasActiveGames())
-	require.True(t, whitelist.MatchDomain("api.pubg.com"))
-}
-
-func TestSessionClientMergedWhitelistFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	t.Cleanup(server.Close)
-
-	client := NewSessionClient(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL: server.URL,
-	}, nil)
-	_, err := client.MergedWhitelist(context.Background(), "alice")
-	require.Error(t, err)
-}
-
-func TestGuardBlocksUnknownDomain(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/session":
-			json.NewEncoder(w).Encode(map[string]any{"active_games": []string{"pubg"}})
-		case "/game/pubg/whitelist":
-			json.NewEncoder(w).Encode(map[string]any{"domains": []string{"*.pubg.com"}})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	guard := NewGuard(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL:   server.URL,
-		SessionPath:       "/session",
-		GameWhitelistPath: "/game/{id}/whitelist",
-	})
-	metadata := adapter.InboundContext{
-		User:        "alice",
-		InboundType: "tuic",
-		Domain:      "evil.com",
+	d, band := cache.Lookup(context.Background(), ip)
+	if d == nil || band != BandHigh {
+		t.Fatalf("want HIGH, got %#v band=%v", d, band)
 	}
-	_, _, err := guard.evaluate(context.Background(), metadata)
-	require.Error(t, err)
-}
-
-func TestGuardSessionFailure(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	t.Cleanup(server.Close)
-
-	guard := NewGuard(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL: server.URL,
-	})
-	metadata := adapter.InboundContext{
-		User:        "alice",
-		InboundType: "tuic",
-		Domain:      "evil.com",
+	// Expire entry but keep it as stale by backdating expire while leaving decision.
+	cache.mu.Lock()
+	e := cache.cache["1.2.3.4"]
+	e.expire = time.Now().Add(-time.Second)
+	cache.cache["1.2.3.4"] = e
+	cache.mu.Unlock()
+	store.fail = true
+	d2, band2 := cache.Lookup(context.Background(), ip)
+	if d2 == nil || band2 != BandHigh || d2.SteamAppID != "1086940" {
+		t.Fatalf("want stale HIGH kept, got %#v band=%v", d2, band2)
 	}
-	_, _, err := guard.evaluate(context.Background(), metadata)
-	require.Error(t, err)
-}
-
-func TestGuardNoDomainUsesConfidence(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
-			"confidence": 0.5,
-			"up_kbps":    300,
-			"down_kbps":  600,
-		})
-	}))
-	t.Cleanup(server.Close)
-
-	guard := NewGuard(testLogger{}, option.TurbineOptions{
-		ControlPlaneURL: server.URL,
-	})
-	metadata := adapter.InboundContext{
-		User:        "alice",
-		InboundType: "tuic",
-		Destination: M.Socksaddr{Addr: netip.MustParseAddr("1.2.3.4")},
-	}
-	up, down, err := guard.evaluate(context.Background(), metadata)
-	require.NoError(t, err)
-	require.Equal(t, 300, up)
-	require.Equal(t, 600, down)
-}
-
-func TestSessionClientMock(t *testing.T) {
-	mock := newMockStore(&option.TurbineMockOptions{
-		Enabled: true,
-		Sessions: map[string]option.TurbineMockSession{
-			"alice": {ActiveGames: []string{"pubg"}},
-		},
-		GameWhitelists: map[string]option.TurbineMockGameWhitelist{
-			"pubg": {Domains: []string{"*.pubg.com"}},
-		},
-	})
-	client := NewSessionClient(testLogger{}, option.TurbineOptions{}, mock)
-	whitelist, err := client.MergedWhitelist(context.Background(), "alice")
-	require.NoError(t, err)
-	require.True(t, whitelist.MatchDomain("api.pubg.com"))
-}
-
-func TestConfidenceClientMock(t *testing.T) {
-	mock := newMockStore(&option.TurbineMockOptions{
-		Enabled: true,
-		Confidence: map[string]option.TurbineMockConfidence{
-			"1.2.3.4": {UpKbps: 800, DownKbps: 1600},
-		},
-		DefaultConfidence: &option.TurbineMockConfidence{UpKbps: 100, DownKbps: 200},
-	})
-	client := NewConfidenceClient(testLogger{}, option.TurbineOptions{}, mock)
-	up, down := client.Lookup(context.Background(), adapter.InboundContext{User: "alice"}, netip.MustParseAddr("1.2.3.4"))
-	require.Equal(t, 800, up)
-	require.Equal(t, 1600, down)
-	up, down = client.Lookup(context.Background(), adapter.InboundContext{User: "bob"}, netip.MustParseAddr("9.9.9.9"))
-	require.Equal(t, 100, up)
-	require.Equal(t, 200, down)
 }
