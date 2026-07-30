@@ -27,6 +27,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.VLESSOutboundOptions](registry, C.TypeVLESS, NewOutbound)
 }
 
+var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	logger          logger.ContextLogger
@@ -83,7 +85,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		case "xudp":
 			outbound.xudp = true
 		default:
-			return nil, E.New("unknown packet encoding: ", options.PacketEncoding)
+			return nil, E.New("unknown packet encoding: ", *options.PacketEncoding)
 		}
 	}
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
@@ -125,6 +127,10 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
 		return h.multiplexDialer.ListenPacket(ctx, destination)
 	}
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.multiplexDialer != nil
 }
 
 func (h *Outbound) InterfaceUpdated() {
