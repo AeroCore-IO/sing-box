@@ -86,28 +86,17 @@ type ednsPacketConn struct {
 	N.PacketConn
 	optionCode    uint16
 	sessionIDFunc func() string
-	onWrite       func() bool
-	onLimited     func()
 }
 
-func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, allow func() bool, onLimited func()) N.PacketConn {
+func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string) N.PacketConn {
 	return &ednsPacketConn{
 		PacketConn:    conn,
 		optionCode:    optionCode,
 		sessionIDFunc: sessionIDFunc,
-		onWrite:       allow,
-		onLimited:     onLimited,
 	}
 }
 
 func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if c.onWrite != nil && !c.onWrite() {
-		buffer.Release()
-		if c.onLimited != nil {
-			c.onLimited()
-		}
-		return nil
-	}
 	sessionID := ""
 	if c.sessionIDFunc != nil {
 		sessionID = c.sessionIDFunc()

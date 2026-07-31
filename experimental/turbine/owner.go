@@ -16,8 +16,7 @@ type userState struct {
 	allowUpdated     int64
 	lastBindOK       bool
 	bindRejectLogged bool
-	lastSeen         time.Time
-	dnsLimiter       *tokenBucket
+	lastSeen time.Time
 
 	mu sync.Mutex
 }
@@ -50,7 +49,6 @@ type OwnerManager struct {
 	store     Store
 	pollEvery time.Duration
 	idleTTL   time.Duration
-	dnsQPS    int
 	events    *sessionLogger
 
 	mu     sync.Mutex
@@ -59,15 +57,12 @@ type OwnerManager struct {
 	wg     sync.WaitGroup
 }
 
-func newOwnerManager(logger logger.ContextLogger, store Store, pollEvery, idleTTL time.Duration, dnsQPS int, events *sessionLogger) *OwnerManager {
+func newOwnerManager(logger logger.ContextLogger, store Store, pollEvery, idleTTL time.Duration, events *sessionLogger) *OwnerManager {
 	if pollEvery <= 0 {
 		pollEvery = 2 * time.Second
 	}
 	if idleTTL <= 0 {
 		idleTTL = 60 * time.Second
-	}
-	if dnsQPS <= 0 {
-		dnsQPS = 50
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &OwnerManager{
@@ -75,7 +70,6 @@ func newOwnerManager(logger logger.ContextLogger, store Store, pollEvery, idleTT
 		store:     store,
 		pollEvery: pollEvery,
 		idleTTL:   idleTTL,
-		dnsQPS:    dnsQPS,
 		events:    events,
 		users:     make(map[string]*userState),
 		cancel:    cancel,
@@ -95,10 +89,9 @@ func (m *OwnerManager) Touch(owner string) *userState {
 	st, ok := m.users[owner]
 	if !ok {
 		st = &userState{
-			owner:      owner,
-			allow:      make(map[string]struct{}),
-			lastSeen:   time.Now(),
-			dnsLimiter: newTokenBucket(m.dnsQPS),
+			owner:    owner,
+			allow:    make(map[string]struct{}),
+			lastSeen: time.Now(),
 		}
 		m.users[owner] = st
 		m.mu.Unlock()
@@ -108,13 +101,6 @@ func (m *OwnerManager) Touch(owner string) *userState {
 	m.mu.Unlock()
 	st.touch()
 	return st
-}
-
-func (m *OwnerManager) AllowDNS(owner string) bool {
-	st := m.Touch(owner)
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.dnsLimiter.allow()
 }
 
 func (m *OwnerManager) SessionID(owner string) string {
@@ -287,35 +273,3 @@ func (m *OwnerManager) reapIdle() {
 	}
 }
 
-// tokenBucket is a simple per-second QPS limiter.
-type tokenBucket struct {
-	qps        int
-	mu         sync.Mutex
-	tokens     float64
-	lastRefill time.Time
-}
-
-func newTokenBucket(qps int) *tokenBucket {
-	return &tokenBucket{
-		qps:        qps,
-		tokens:     float64(qps),
-		lastRefill: time.Now(),
-	}
-}
-
-func (b *tokenBucket) allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	elapsed := now.Sub(b.lastRefill).Seconds()
-	b.lastRefill = now
-	b.tokens += elapsed * float64(b.qps)
-	if b.tokens > float64(b.qps) {
-		b.tokens = float64(b.qps)
-	}
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
-}

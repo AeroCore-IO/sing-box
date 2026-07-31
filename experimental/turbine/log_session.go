@@ -20,7 +20,6 @@ type sessionEvent struct {
 	UpdatedAt  *int64   `json:"updated_at,omitempty"`
 	DstIP      string   `json:"dst_ip,omitempty"`
 	Confidence *float64 `json:"confidence,omitempty"`
-	Limited    *bool    `json:"limited,omitempty"`
 	Stale      *bool    `json:"stale,omitempty"`
 }
 
@@ -80,7 +79,7 @@ func (l *sessionLogger) route(owner, sessionID string, action RouteAction, steam
 	})
 }
 
-func (l *sessionLogger) dnsBypass(owner, sessionID string, limited bool) {
-	lim := limited
-	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, Limited: &lim})
+func (l *sessionLogger) dnsBypass(owner, sessionID, dstIP string) {
+	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, DstIP: dstIP})
 }
+

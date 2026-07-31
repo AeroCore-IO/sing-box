@@ -45,7 +45,6 @@ func NewGuard(logger logger.ContextLogger, options option.TurbineOptions) *Guard
 
 	poll := time.Duration(options.AllowPollInterval)
 	idle := time.Duration(options.UserStateIdleTTL)
-	dnsQPS := options.DNSQPSPerUser
 
 	var ttlHigh, ttlLow, ttlNeg time.Duration
 	threshold := options.ThresholdT
@@ -63,7 +62,7 @@ func NewGuard(logger logger.ContextLogger, options option.TurbineOptions) *Guard
 	return &Guard{
 		logger:    logger,
 		store:     store,
-		owners:    newOwnerManager(logger, store, poll, idle, dnsQPS, events),
+		owners:    newOwnerManager(logger, store, poll, idle, events),
 		decisions: newDecisionCache(logger, store, ttlHigh, ttlLow, ttlNeg, threshold),
 		blacklist: newBlacklist(logger, options.Blacklist),
 		dnsIPs:    newDNSIPSet(options.HKDNSResolverIPs),
@@ -108,28 +107,25 @@ func (g *Guard) isDNSBypass(metadata adapter.InboundContext) bool {
 	return isDNSBypass(ip, port, g.dnsIPs)
 }
 
-// dnsBypassTCP applies per-user QPS; EDNS rewrite is UDP-only.
-// Over-limit uses silent RejectedError (same as session rejected).
+// dnsBypassTCP keeps owner state warm; EDNS rewrite is UDP-only.
 func (g *Guard) dnsBypassTCP(metadata adapter.InboundContext) error {
-	owner := metadata.User
-	g.owners.Touch(owner)
-	if !g.owners.AllowDNS(owner) {
-		g.events.dnsBypass(owner, g.owners.SessionID(owner), true)
-		return rejected()
-	}
+	g.logDNSBypass(metadata)
 	return nil
 }
 
 func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundContext) N.PacketConn {
 	owner := metadata.User
-	g.owners.Touch(owner)
+	g.logDNSBypass(metadata)
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	}, func() bool {
-		return g.owners.AllowDNS(owner)
-	}, func() {
-		g.events.dnsBypass(owner, g.owners.SessionID(owner), true)
 	})
+}
+
+func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {
+	owner := metadata.User
+	g.owners.Touch(owner)
+	ip, _ := destinationAddrPort(metadata)
+	g.events.dnsBypass(owner, g.owners.SessionID(owner), canonicalizeIP(ip))
 }
 
 func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (RouteAction, error) {

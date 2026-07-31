@@ -236,7 +236,7 @@ func TestOwnerDriftClearsAllow(t *testing.T) {
 		},
 	})
 	events := newSessionLogger(testLogger{})
-	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, 50, events)
+	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, events)
 	defer om.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -267,7 +267,7 @@ func TestPollFailKeepsSnapshot(t *testing.T) {
 			"sess1": {Owner: "user1", SteamAppIDs: []string{"1086940"}},
 		},
 	})
-	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, 50, newSessionLogger(testLogger{}))
+	om := newOwnerManager(testLogger{}, mock, 20*time.Millisecond, time.Hour, newSessionLogger(testLogger{}))
 	defer om.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

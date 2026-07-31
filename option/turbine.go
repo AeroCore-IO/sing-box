@@ -10,7 +10,6 @@ type TurbineOptions struct {
 	DecisionCache         *TurbineDecisionCache      `json:"decision_cache,omitempty"`
 	HKDNSResolverIPs      badoption.Listable[string] `json:"hk_dns_resolver_ips,omitempty"`
 	EDNSSessionOptionCode uint16                     `json:"edns_session_option_code,omitempty"`
-	DNSQPSPerUser         int                        `json:"dns_qps_per_user,omitempty"`
 	UserStateIdleTTL      badoption.Duration         `json:"user_state_idle_ttl,omitempty"`
 	Blacklist             badoption.Listable[string] `json:"blacklist,omitempty"`
 	Mock                  *TurbineMockOptions        `json:"mock,omitempty"`
