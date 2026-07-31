@@ -27,6 +27,8 @@ type sessionEvent struct {
 	BytesOut   *int     `json:"bytes_out,omitempty"`
 	Headroom   *int     `json:"headroom,omitempty"`
 	RCode      *int     `json:"rcode,omitempty"`
+	Header     string   `json:"dns_hdr,omitempty"`
+	PayloadHex string   `json:"payload_hex,omitempty"`
 }
 
 type sessionLogger struct {
@@ -89,34 +91,38 @@ func (l *sessionLogger) dnsBypass(owner, sessionID, dstIP string) {
 	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, DstIP: dstIP})
 }
 
-func (l *sessionLogger) dnsQuery(owner, sessionID, dstIP, qname, qtype, reason string, bytesIn, bytesOut, headroom int) {
+func (l *sessionLogger) dnsQuery(owner, sessionID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, bytesOut, headroom int) {
 	in, out, hr := bytesIn, bytesOut, headroom
 	l.emit(sessionEvent{
-		Event:     "session.dns_query",
-		Owner:     owner,
-		SessionID: sessionID,
-		DstIP:     dstIP,
-		QName:     qname,
-		QType:     qtype,
-		Reason:    reason,
-		BytesIn:   &in,
-		BytesOut:  &out,
-		Headroom:  &hr,
+		Event:      "session.dns_query",
+		Owner:      owner,
+		SessionID:  sessionID,
+		DstIP:      dstIP,
+		QName:      qname,
+		QType:      qtype,
+		Reason:     reason,
+		BytesIn:    &in,
+		BytesOut:   &out,
+		Headroom:   &hr,
+		Header:     header,
+		PayloadHex: payloadHex,
 	})
 }
 
-func (l *sessionLogger) dnsResponse(owner, sessionID, dstIP, qname, qtype, reason string, bytesIn, rcode int) {
+func (l *sessionLogger) dnsResponse(owner, sessionID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, rcode int) {
 	in, rc := bytesIn, rcode
 	l.emit(sessionEvent{
-		Event:     "session.dns_response",
-		Owner:     owner,
-		SessionID: sessionID,
-		DstIP:     dstIP,
-		QName:     qname,
-		QType:     qtype,
-		Reason:    reason,
-		BytesIn:   &in,
-		RCode:     &rc,
+		Event:      "session.dns_response",
+		Owner:      owner,
+		SessionID:  sessionID,
+		DstIP:      dstIP,
+		QName:      qname,
+		QType:      qtype,
+		Reason:     reason,
+		BytesIn:    &in,
+		RCode:      &rc,
+		Header:     header,
+		PayloadHex: payloadHex,
 	})
 }
 
