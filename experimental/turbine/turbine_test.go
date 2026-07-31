@@ -1,8 +1,10 @@
 package turbine
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -317,6 +320,120 @@ func TestRewriteEDNSSession(t *testing.T) {
 	}
 	if _, ok := rewriteEDNSSession(out, 65001, ""); !ok {
 		t.Fatal("expected clear rewrite")
+	}
+}
+
+func packDNSQuestion(t *testing.T) []byte {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeA)
+	m.SetEdns0(1232, false)
+	raw, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func hasEDNSSession(raw []byte, code uint16, sessionID string) bool {
+	var parsed dns.Msg
+	if err := parsed.Unpack(raw); err != nil {
+		return false
+	}
+	opt := parsed.IsEdns0()
+	if opt == nil {
+		return false
+	}
+	for _, o := range opt.Option {
+		if local, ok := o.(*dns.EDNS0_LOCAL); ok && local.Code == code {
+			return string(local.Data) == sessionID
+		}
+	}
+	return false
+}
+
+// stubPacketConn feeds a fixed payload on ReadPacket and records WritePacket bytes.
+type stubPacketConn struct {
+	readPayload []byte
+	wrote       []byte
+}
+
+func (c *stubPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	_, err = buffer.Write(c.readPayload)
+	return M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53), err
+}
+
+func (c *stubPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.wrote = append([]byte(nil), buffer.Bytes()...)
+	return nil
+}
+
+func (c *stubPacketConn) Close() error                       { return nil }
+func (c *stubPacketConn) LocalAddr() net.Addr                { return nil }
+func (c *stubPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (c *stubPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *stubPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func TestEDNSPacketConnRewritesReadNotWrite(t *testing.T) {
+	raw := packDNSQuestion(t)
+	inner := &stubPacketConn{readPayload: raw}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" })
+
+	// Query path (client → resolver): ReadPacket must inject session.
+	readBuf := buf.NewPacket()
+	defer readBuf.Release()
+	headroom := 64
+	readBuf.Resize(headroom, 0)
+	_, err := conn.ReadPacket(readBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readBuf.Start() != headroom {
+		t.Fatalf("headroom destroyed: start=%d want=%d", readBuf.Start(), headroom)
+	}
+	if !hasEDNSSession(readBuf.Bytes(), 65001, "sess_abc") {
+		t.Fatal("ReadPacket should rewrite DNS query with session option")
+	}
+
+	// Response path (resolver → client): WritePacket must leave payload alone.
+	respBuf := buf.NewPacket()
+	defer respBuf.Release()
+	respBuf.Resize(headroom, 0)
+	if _, err := respBuf.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WritePacket(respBuf, M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53)); err != nil {
+		t.Fatal(err)
+	}
+	if hasEDNSSession(inner.wrote, 65001, "sess_abc") {
+		t.Fatal("WritePacket must not rewrite DNS responses")
+	}
+	if !bytes.Equal(inner.wrote, raw) {
+		t.Fatal("WritePacket should pass response through unchanged")
+	}
+}
+
+func TestReplaceBufferPayloadPreservesHeadroom(t *testing.T) {
+	raw := packDNSQuestion(t)
+	rewritten, ok := rewriteEDNSSession(raw, 65001, "sess_abc")
+	if !ok {
+		t.Fatal("expected rewrite")
+	}
+	buffer := buf.NewPacket()
+	defer buffer.Release()
+	const headroom = 48
+	buffer.Resize(headroom, 0)
+	if _, err := buffer.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if !replaceBufferPayload(buffer, rewritten) {
+		t.Fatal("replace failed")
+	}
+	if buffer.Start() != headroom {
+		t.Fatalf("start=%d want=%d", buffer.Start(), headroom)
+	}
+	if !bytes.Equal(buffer.Bytes(), rewritten) {
+		t.Fatal("payload mismatch")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -82,6 +83,19 @@ func rewriteEDNSSession(msg []byte, optionCode uint16, sessionID string) ([]byte
 	return packed, true
 }
 
+// replaceBufferPayload rewrites buffer contents in place while preserving front headroom.
+// Resize(0, 0) would destroy headroom that hy2/tuic (and outbound writers) rely on.
+func replaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
+	start := buffer.Start()
+	need := start + len(rewritten)
+	if buffer.Cap() < need {
+		return false
+	}
+	buffer.Resize(start, 0)
+	n, err := buffer.Write(rewritten)
+	return err == nil && n == len(rewritten)
+}
+
 type ednsPacketConn struct {
 	N.PacketConn
 	optionCode    uint16
@@ -96,22 +110,51 @@ func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func
 	}
 }
 
-func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+// ReadPacket rewrites outbound DNS queries (client → resolver).
+// WritePacket is the reverse path (resolver → client) and must not be touched.
+func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	destination, err = c.PacketConn.ReadPacket(buffer)
+	if err != nil {
+		return
+	}
+	c.rewriteQuery(buffer)
+	return
+}
+
+func (c *ednsPacketConn) CreateReadWaiter() (N.PacketReadWaiter, bool) {
+	readWaiter, ok := bufio.CreatePacketReadWaiter(c.PacketConn)
+	if !ok {
+		return nil, false
+	}
+	return &ednsPacketReadWaiter{conn: c, readWaiter: readWaiter}, true
+}
+
+type ednsPacketReadWaiter struct {
+	conn       *ednsPacketConn
+	readWaiter N.PacketReadWaiter
+}
+
+func (w *ednsPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	return w.readWaiter.InitializeReadWaiter(options)
+}
+
+func (w *ednsPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	buffer, destination, err = w.readWaiter.WaitReadPacket()
+	if err != nil {
+		return
+	}
+	w.conn.rewriteQuery(buffer)
+	return
+}
+
+func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer) {
 	sessionID := ""
 	if c.sessionIDFunc != nil {
 		sessionID = c.sessionIDFunc()
 	}
-	data := buffer.Bytes()
-	rewritten, ok := rewriteEDNSSession(data, c.optionCode, sessionID)
-	if ok {
-		need := len(rewritten)
-		if buffer.Cap() >= need {
-			buffer.Resize(0, 0)
-			n, err := buffer.Write(rewritten)
-			if err != nil || n != need {
-				return c.PacketConn.WritePacket(buffer, destination)
-			}
-		}
+	rewritten, ok := rewriteEDNSSession(buffer.Bytes(), c.optionCode, sessionID)
+	if !ok {
+		return
 	}
-	return c.PacketConn.WritePacket(buffer, destination)
+	_ = replaceBufferPayload(buffer, rewritten)
 }
