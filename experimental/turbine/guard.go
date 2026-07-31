@@ -118,7 +118,7 @@ func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundCont
 	g.logDNSBypass(metadata)
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	})
+	}, g.events, owner)
 }
 
 func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {

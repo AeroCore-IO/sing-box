@@ -377,7 +377,7 @@ func (c *stubPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func TestEDNSPacketConnRewritesReadNotWrite(t *testing.T) {
 	raw := packDNSQuestion(t)
 	inner := &stubPacketConn{readPayload: raw}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" })
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1")
 
 	// Query path (client → resolver): ReadPacket must inject session.
 	readBuf := buf.NewPacket()

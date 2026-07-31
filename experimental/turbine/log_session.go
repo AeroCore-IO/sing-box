@@ -21,6 +21,12 @@ type sessionEvent struct {
 	DstIP      string   `json:"dst_ip,omitempty"`
 	Confidence *float64 `json:"confidence,omitempty"`
 	Stale      *bool    `json:"stale,omitempty"`
+	QName      string   `json:"qname,omitempty"`
+	QType      string   `json:"qtype,omitempty"`
+	BytesIn    *int     `json:"bytes_in,omitempty"`
+	BytesOut   *int     `json:"bytes_out,omitempty"`
+	Headroom   *int     `json:"headroom,omitempty"`
+	RCode      *int     `json:"rcode,omitempty"`
 }
 
 type sessionLogger struct {
@@ -81,5 +87,47 @@ func (l *sessionLogger) route(owner, sessionID string, action RouteAction, steam
 
 func (l *sessionLogger) dnsBypass(owner, sessionID, dstIP string) {
 	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, DstIP: dstIP})
+}
+
+func (l *sessionLogger) dnsQuery(owner, sessionID, dstIP, qname, qtype, reason string, bytesIn, bytesOut, headroom int) {
+	in, out, hr := bytesIn, bytesOut, headroom
+	l.emit(sessionEvent{
+		Event:     "session.dns_query",
+		Owner:     owner,
+		SessionID: sessionID,
+		DstIP:     dstIP,
+		QName:     qname,
+		QType:     qtype,
+		Reason:    reason,
+		BytesIn:   &in,
+		BytesOut:  &out,
+		Headroom:  &hr,
+	})
+}
+
+func (l *sessionLogger) dnsResponse(owner, sessionID, dstIP, qname, qtype, reason string, bytesIn, rcode int) {
+	in, rc := bytesIn, rcode
+	l.emit(sessionEvent{
+		Event:     "session.dns_response",
+		Owner:     owner,
+		SessionID: sessionID,
+		DstIP:     dstIP,
+		QName:     qname,
+		QType:     qtype,
+		Reason:    reason,
+		BytesIn:   &in,
+		RCode:     &rc,
+	})
+}
+
+func (l *sessionLogger) dnsError(owner, sessionID, dstIP, direction, reason string) {
+	l.emit(sessionEvent{
+		Event:     "session.dns_error",
+		Owner:     owner,
+		SessionID: sessionID,
+		DstIP:     dstIP,
+		Action:    direction,
+		Reason:    reason,
+	})
 }
 

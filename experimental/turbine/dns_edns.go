@@ -2,7 +2,11 @@ package turbine
 
 import (
 	"bytes"
+	"errors"
+	"io"
+	"net"
 	"net/netip"
+	"os"
 
 	"github.com/miekg/dns"
 	"github.com/sagernet/sing/common/buf"
@@ -44,14 +48,19 @@ func isDNSBypass(dst netip.Addr, port uint16, pinned *dnsIPSet) bool {
 
 // rewriteEDNSSession sets or clears a private EDNS0 option carrying session_id.
 func rewriteEDNSSession(msg []byte, optionCode uint16, sessionID string) ([]byte, bool) {
+	out, reason := rewriteEDNSSessionDetail(msg, optionCode, sessionID)
+	return out, reason == "ok"
+}
+
+func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) ([]byte, string) {
 	var m dns.Msg
 	if err := m.Unpack(msg); err != nil {
-		return msg, false
+		return msg, "unpack_fail"
 	}
 	opt := m.IsEdns0()
 	if opt == nil {
 		if sessionID == "" {
-			return msg, false
+			return msg, "unchanged"
 		}
 		opt = new(dns.OPT)
 		opt.Hdr.Name = "."
@@ -75,12 +84,12 @@ func rewriteEDNSSession(msg []byte, optionCode uint16, sessionID string) ([]byte
 	}
 	packed, err := m.Pack()
 	if err != nil {
-		return msg, false
+		return msg, "pack_fail"
 	}
 	if bytes.Equal(packed, msg) {
-		return msg, false
+		return msg, "unchanged"
 	}
-	return packed, true
+	return packed, "ok"
 }
 
 // replaceBufferPayload rewrites buffer contents in place while preserving front headroom.
@@ -96,34 +105,71 @@ func replaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
 	return err == nil && n == len(rewritten)
 }
 
+func dnsQuestionMeta(msg []byte) (qname, qtype string, rcode int) {
+	var m dns.Msg
+	if err := m.Unpack(msg); err != nil {
+		return "", "", -1
+	}
+	rcode = m.Rcode
+	if len(m.Question) > 0 {
+		q := m.Question[0]
+		return q.Name, dns.TypeToString[q.Qtype], rcode
+	}
+	return "", "", rcode
+}
+
 type ednsPacketConn struct {
 	N.PacketConn
 	optionCode    uint16
 	sessionIDFunc func() string
+	events        *sessionLogger
+	owner         string
 }
 
-func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string) N.PacketConn {
+func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner string) N.PacketConn {
 	return &ednsPacketConn{
 		PacketConn:    conn,
 		optionCode:    optionCode,
 		sessionIDFunc: sessionIDFunc,
+		events:        events,
+		owner:         owner,
 	}
 }
 
+func (c *ednsPacketConn) sessionID() string {
+	if c.sessionIDFunc == nil {
+		return ""
+	}
+	return c.sessionIDFunc()
+}
+
 // ReadPacket rewrites outbound DNS queries (client → resolver).
-// WritePacket is the reverse path (resolver → client) and must not be touched.
 func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	destination, err = c.PacketConn.ReadPacket(buffer)
 	if err != nil {
+		c.logError(destination, "read", err)
 		return
 	}
-	c.rewriteQuery(buffer)
+	c.rewriteQuery(buffer, destination)
 	return
+}
+
+// WritePacket is the reverse path (resolver → client). Log only — do not rewrite.
+func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.logResponse(buffer, destination)
+	err := c.PacketConn.WritePacket(buffer, destination)
+	if err != nil {
+		c.logError(destination, "write", err)
+	}
+	return err
 }
 
 func (c *ednsPacketConn) CreateReadWaiter() (N.PacketReadWaiter, bool) {
 	readWaiter, ok := bufio.CreatePacketReadWaiter(c.PacketConn)
 	if !ok {
+		if c.events != nil {
+			c.events.dnsError(c.owner, c.sessionID(), "", "wait_reader", "unavailable_fallback_readpacket")
+		}
 		return nil, false
 	}
 	return &ednsPacketReadWaiter{conn: c, readWaiter: readWaiter}, true
@@ -141,20 +187,57 @@ func (w *ednsPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (
 func (w *ednsPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
 	buffer, destination, err = w.readWaiter.WaitReadPacket()
 	if err != nil {
+		w.conn.logError(destination, "wait_read", err)
 		return
 	}
-	w.conn.rewriteQuery(buffer)
+	w.conn.rewriteQuery(buffer, destination)
 	return
 }
 
-func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer) {
-	sessionID := ""
-	if c.sessionIDFunc != nil {
-		sessionID = c.sessionIDFunc()
+func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksaddr) {
+	sessionID := c.sessionID()
+	bytesIn := buffer.Len()
+	headroom := buffer.Start()
+	qname, qtype, _ := dnsQuestionMeta(buffer.Bytes())
+	dstIP := destination.Addr.Unmap().String()
+
+	rewritten, reason := rewriteEDNSSessionDetail(buffer.Bytes(), c.optionCode, sessionID)
+	bytesOut := bytesIn
+	if reason == "ok" {
+		if !replaceBufferPayload(buffer, rewritten) {
+			reason = "capacity"
+		} else {
+			bytesOut = buffer.Len()
+		}
 	}
-	rewritten, ok := rewriteEDNSSession(buffer.Bytes(), c.optionCode, sessionID)
-	if !ok {
+	if c.events != nil {
+		c.events.dnsQuery(c.owner, sessionID, dstIP, qname, qtype, reason, bytesIn, bytesOut, headroom)
+	}
+}
+
+func (c *ednsPacketConn) logResponse(buffer *buf.Buffer, destination M.Socksaddr) {
+	if c.events == nil {
 		return
 	}
-	_ = replaceBufferPayload(buffer, rewritten)
+	qname, qtype, rcode := dnsQuestionMeta(buffer.Bytes())
+	dstIP := destination.Addr.Unmap().String()
+	c.events.dnsResponse(c.owner, c.sessionID(), dstIP, qname, qtype, "passthrough", buffer.Len(), rcode)
+}
+
+func (c *ednsPacketConn) logError(destination M.Socksaddr, direction string, err error) {
+	if c.events == nil || err == nil || isBenignPacketErr(err) {
+		return
+	}
+	dstIP := ""
+	if destination.IsValid() {
+		dstIP = destination.Addr.Unmap().String()
+	}
+	c.events.dnsError(c.owner, c.sessionID(), dstIP, direction, err.Error())
+}
+
+func isBenignPacketErr(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded)
 }
