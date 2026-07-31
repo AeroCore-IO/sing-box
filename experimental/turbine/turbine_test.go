@@ -38,7 +38,7 @@ func testGuard(mock *option.TurbineMockOptions) *Guard {
 		AllowPollInterval: badoption.Duration(50 * time.Millisecond),
 		UserStateIdleTTL:  badoption.Duration(time.Hour),
 		ThresholdT:        0.70,
-		HKDNSResolverIPs:  []string{"10.0.0.53"},
+		HKDNSResolverIPs:  []string{"10.0.0.53:53"},
 		Blacklist:         []string{"9.9.9.9"},
 		Mock:              mock,
 	})
@@ -191,6 +191,39 @@ func TestDNSBypassSkipsDecision(t *testing.T) {
 	}
 	if !g.isDNSBypass(meta("user1", "10.0.0.53", 53)) {
 		t.Fatal("expected dns bypass match")
+	}
+	if g.isDNSBypass(meta("user1", "10.0.0.53", 5353)) {
+		t.Fatal("wrong port should not match")
+	}
+}
+
+func TestDNSBypassCustomPort(t *testing.T) {
+	g := NewGuard(testLogger{}, option.TurbineOptions{
+		Enabled:          true,
+		HKDNSResolverIPs: []string{"10.0.0.53:5353", "[2001:db8::1]:853"},
+		Mock:             &option.TurbineMockOptions{Enabled: true},
+	})
+	defer g.Close()
+	if !g.isDNSBypass(meta("user1", "10.0.0.53", 5353)) {
+		t.Fatal("expected custom port match")
+	}
+	if g.isDNSBypass(meta("user1", "10.0.0.53", 53)) {
+		t.Fatal("default port should not match when only custom port configured")
+	}
+	if !g.isDNSBypass(meta("user1", "2001:db8::1", 853)) {
+		t.Fatal("expected IPv6 addr:port match")
+	}
+}
+
+func TestDNSBypassBareIPDefaultsPort53(t *testing.T) {
+	g := NewGuard(testLogger{}, option.TurbineOptions{
+		Enabled:          true,
+		HKDNSResolverIPs: []string{"10.0.0.53"},
+		Mock:             &option.TurbineMockOptions{Enabled: true},
+	})
+	defer g.Close()
+	if !g.isDNSBypass(meta("user1", "10.0.0.53", 53)) {
+		t.Fatal("bare IP should default to port 53")
 	}
 }
 

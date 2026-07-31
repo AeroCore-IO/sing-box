@@ -11,29 +11,34 @@ import (
 )
 
 type dnsIPSet struct {
-	addrs map[netip.Addr]struct{}
+	addrs map[netip.AddrPort]struct{}
 }
 
-func newDNSIPSet(ips []string) *dnsIPSet {
-	s := &dnsIPSet{addrs: make(map[netip.Addr]struct{})}
-	for _, raw := range ips {
+// newDNSIPSet accepts "ip:port" (IPv6 as "[addr]:port"). Bare IP defaults to port 53.
+func newDNSIPSet(entries []string) *dnsIPSet {
+	s := &dnsIPSet{addrs: make(map[netip.AddrPort]struct{})}
+	for _, raw := range entries {
+		if ap, err := netip.ParseAddrPort(raw); err == nil {
+			s.addrs[netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())] = struct{}{}
+			continue
+		}
 		if a, err := netip.ParseAddr(raw); err == nil {
-			s.addrs[a.Unmap()] = struct{}{}
+			s.addrs[netip.AddrPortFrom(a.Unmap(), 53)] = struct{}{}
 		}
 	}
 	return s
 }
 
-func (s *dnsIPSet) contains(ip netip.Addr) bool {
+func (s *dnsIPSet) contains(ip netip.Addr, port uint16) bool {
 	if s == nil || !ip.IsValid() {
 		return false
 	}
-	_, ok := s.addrs[ip.Unmap()]
+	_, ok := s.addrs[netip.AddrPortFrom(ip.Unmap(), port)]
 	return ok
 }
 
 func isDNSBypass(dst netip.Addr, port uint16, pinned *dnsIPSet) bool {
-	return port == 53 && pinned.contains(dst)
+	return pinned.contains(dst, port)
 }
 
 // rewriteEDNSSession sets or clears a private EDNS0 option carrying session_id.
