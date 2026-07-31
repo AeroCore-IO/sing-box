@@ -3,6 +3,8 @@ package turbine
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/netip"
@@ -434,6 +436,70 @@ func TestReplaceBufferPayloadPreservesHeadroom(t *testing.T) {
 	}
 	if !bytes.Equal(buffer.Bytes(), rewritten) {
 		t.Fatal("payload mismatch")
+	}
+}
+
+func TestStripTCPDNSLengthPrefix(t *testing.T) {
+	// Captured production payload: TCP-style 2-byte length prefix + DNS query for example.com.
+	framed, err := hex.DecodeString("0028e65701000001000000000001076578616d706c6503636f6d000001000100002904d0000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := stripTCPDNSLengthPrefix(framed)
+	if !ok {
+		t.Fatal("expected strip")
+	}
+	var parsed dns.Msg
+	if err := parsed.Unpack(msg); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Question) != 1 || parsed.Question[0].Name != "example.com." {
+		t.Fatalf("question=%v", parsed.Question)
+	}
+}
+
+func TestEDNSPacketConnStripsTCPFrameOnQuery(t *testing.T) {
+	framed, err := hex.DecodeString("0028e65701000001000000000001076578616d706c6503636f6d000001000100002904d0000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &stubPacketConn{readPayload: framed}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1")
+
+	readBuf := buf.NewPacket()
+	defer readBuf.Release()
+	_, err = conn.ReadPacket(readBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := readBuf.Bytes()
+	if len(out) >= 2 && binary.BigEndian.Uint16(out[:2]) == uint16(len(out)-2) {
+		t.Fatal("length prefix should be stripped before forwarding to UDP resolver")
+	}
+	if !hasEDNSSession(out, 65001, "sess_abc") {
+		t.Fatal("expected EDNS session after stripping TCP frame")
+	}
+
+	// Response back to client that used TCP framing should be re-prefixed.
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	req.Id = 0xe657
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	rawResp, err := resp.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBuf := buf.NewPacket()
+	defer respBuf.Release()
+	if _, err := respBuf.Write(rawResp); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WritePacket(respBuf, M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53)); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.wrote) < 2 || binary.BigEndian.Uint16(inner.wrote[:2]) != uint16(len(inner.wrote)-2) {
+		t.Fatalf("response should be TCP-framed for client, got hex=%x", inner.wrote)
 	}
 }
 

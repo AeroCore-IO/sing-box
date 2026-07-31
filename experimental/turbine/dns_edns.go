@@ -98,6 +98,31 @@ func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) (
 	return packed, "ok"
 }
 
+// stripTCPDNSLengthPrefix detects DNS-over-TCP style 2-byte length prefix on a UDP payload.
+// Production captures showed clients sending "0028" + 40-byte DNS query to :5353.
+func stripTCPDNSLengthPrefix(msg []byte) ([]byte, bool) {
+	if len(msg) < 14 { // 2-byte len + 12-byte DNS header
+		return msg, false
+	}
+	declared := int(binary.BigEndian.Uint16(msg[:2]))
+	if declared != len(msg)-2 || declared < 12 {
+		return msg, false
+	}
+	body := msg[2:]
+	var m dns.Msg
+	if err := m.Unpack(body); err != nil {
+		return msg, false
+	}
+	return body, true
+}
+
+func prependTCPDNSLengthPrefix(msg []byte) []byte {
+	out := make([]byte, 2+len(msg))
+	binary.BigEndian.PutUint16(out[:2], uint16(len(msg)))
+	copy(out[2:], msg)
+	return out
+}
+
 // replaceBufferPayload rewrites buffer contents in place while preserving front headroom.
 // Resize(0, 0) would destroy headroom that hy2/tuic (and outbound writers) rely on.
 func replaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
@@ -152,6 +177,7 @@ type ednsPacketConn struct {
 	sessionIDFunc func() string
 	events        *sessionLogger
 	owner         string
+	tcpFramed     bool // client sent DNS-over-TCP length prefix over UDP
 }
 
 func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner string) N.PacketConn {
@@ -182,9 +208,15 @@ func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr
 	return
 }
 
-// WritePacket is the reverse path (resolver → client). Log only — do not rewrite.
+// WritePacket is the reverse path (resolver → client). Re-frame if client used TCP length prefix.
 func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	c.logResponse(buffer, destination)
+	if c.tcpFramed {
+		framed := prependTCPDNSLengthPrefix(buffer.Bytes())
+		if !replaceBufferPayload(buffer, framed) {
+			c.logError(destination, "write_frame", errors.New("capacity"))
+		}
+	}
 	err := c.PacketConn.WritePacket(buffer, destination)
 	if err != nil {
 		c.logError(destination, "write", err)
@@ -227,22 +259,46 @@ func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksadd
 	payload := buffer.Bytes()
 	bytesIn := len(payload)
 	headroom := buffer.Start()
-	qname, qtype, _ := dnsQuestionMeta(payload)
 	dstIP := destination.Addr.Unmap().String()
-	header := peekDNSHeader(payload)
 
-	rewritten, reason := rewriteEDNSSessionDetail(payload, c.optionCode, sessionID)
-	bytesOut := bytesIn
-	if reason == "ok" {
+	dnsMsg := payload
+	framed := false
+	if body, ok := stripTCPDNSLengthPrefix(payload); ok {
+		dnsMsg = body
+		framed = true
+		c.tcpFramed = true
+	}
+
+	qname, qtype, _ := dnsQuestionMeta(dnsMsg)
+	header := peekDNSHeader(dnsMsg)
+
+	rewritten, reason := rewriteEDNSSessionDetail(dnsMsg, c.optionCode, sessionID)
+	if framed && reason != "ok" {
+		// Still forward unwrapped DNS even when EDNS rewrite is a no-op / session empty.
+		if !replaceBufferPayload(buffer, dnsMsg) {
+			reason = "capacity"
+		} else if reason == "unchanged" || reason == "unchanged:session_empty" {
+			reason = "stripped_tcp_frame:" + reason
+		} else {
+			reason = "stripped_tcp_frame:" + reason
+		}
+	} else if reason == "ok" {
 		if !replaceBufferPayload(buffer, rewritten) {
 			reason = "capacity"
-		} else {
-			bytesOut = buffer.Len()
+		} else if framed {
+			reason = "ok:stripped_tcp_frame"
 		}
+	} else if framed {
+		// unpack of inner message failed after strip? shouldn't happen; keep original
+		reason = "strip_keep_original:" + reason
 	}
+
+	bytesOut := buffer.Len()
 	if c.events != nil {
 		hexStr := ""
-		if reason != "ok" && reason != "unchanged" {
+		if reason != "ok" && reason != "ok:stripped_tcp_frame" &&
+			reason != "unchanged" && reason != "stripped_tcp_frame:unchanged" &&
+			reason != "stripped_tcp_frame:unchanged:session_empty" {
 			hexStr = payloadHex(payload)
 		}
 		c.events.dnsQuery(c.owner, sessionID, dstIP, qname, qtype, reason, header, hexStr, bytesIn, bytesOut, headroom)
