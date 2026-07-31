@@ -2,6 +2,7 @@ package turbine
 
 import (
 	"net/netip"
+	"strings"
 
 	"github.com/sagernet/sing/common/logger"
 )
@@ -16,6 +17,7 @@ func newBlacklist(logger logger.ContextLogger, entries []string) *Blacklist {
 		addrs: make(map[netip.Addr]struct{}),
 	}
 	for _, e := range entries {
+		e = strings.TrimSpace(e)
 		if e == "" {
 			continue
 		}

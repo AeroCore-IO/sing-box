@@ -15,6 +15,7 @@ type sessionEvent struct {
 	Owner      string   `json:"owner,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
 	Action     string   `json:"action,omitempty"`
+	Direction  string   `json:"direction,omitempty"`
 	SteamAppID string   `json:"steam_app_id,omitempty"`
 	AllowN     *int     `json:"allow_n,omitempty"`
 	UpdatedAt  *int64   `json:"updated_at,omitempty"`
@@ -51,35 +52,36 @@ func (l *sessionLogger) emit(ev sessionEvent) {
 	l.logger.Info(string(b))
 }
 
-func (l *sessionLogger) bindOK(owner, sessionID string) {
-	l.emit(sessionEvent{Event: "session.bind.ok", Owner: owner, SessionID: sessionID})
+func (l *sessionLogger) bindOK(owner, sessionID, tunnelID string) {
+	l.emit(sessionEvent{Event: "session.bind.ok", Owner: owner, SessionID: sessionID, TunnelID: tunnelID})
 }
 
-func (l *sessionLogger) bindReject(owner, sessionID, reason string) {
-	l.emit(sessionEvent{Event: "session.bind.reject", Owner: owner, SessionID: sessionID, Reason: reason})
+func (l *sessionLogger) bindReject(owner, sessionID, tunnelID, reason string) {
+	l.emit(sessionEvent{Event: "session.bind.reject", Owner: owner, SessionID: sessionID, TunnelID: tunnelID, Reason: reason})
 }
 
-func (l *sessionLogger) unbind(owner, sessionID, reason string) {
-	l.emit(sessionEvent{Event: "session.unbind", Owner: owner, SessionID: sessionID, Reason: reason})
+func (l *sessionLogger) unbind(owner, sessionID, tunnelID, reason string) {
+	l.emit(sessionEvent{Event: "session.unbind", Owner: owner, SessionID: sessionID, TunnelID: tunnelID, Reason: reason})
 }
 
-func (l *sessionLogger) allowPollOK(owner, sessionID string, allowN int, updatedAt int64) {
+func (l *sessionLogger) allowPollOK(owner, sessionID, tunnelID string, allowN int, updatedAt int64) {
 	n := allowN
 	u := updatedAt
-	l.emit(sessionEvent{Event: "session.allow.poll_ok", Owner: owner, SessionID: sessionID, AllowN: &n, UpdatedAt: &u})
+	l.emit(sessionEvent{Event: "session.allow.poll_ok", Owner: owner, SessionID: sessionID, TunnelID: tunnelID, AllowN: &n, UpdatedAt: &u})
 }
 
-func (l *sessionLogger) allowPollFail(owner, sessionID string) {
+func (l *sessionLogger) allowPollFail(owner, sessionID, tunnelID string) {
 	stale := true
-	l.emit(sessionEvent{Event: "session.allow.poll_fail", Owner: owner, SessionID: sessionID, Stale: &stale})
+	l.emit(sessionEvent{Event: "session.allow.poll_fail", Owner: owner, SessionID: sessionID, TunnelID: tunnelID, Stale: &stale})
 }
 
-func (l *sessionLogger) route(owner, sessionID string, action RouteAction, steamAppID, dstIP string, confidence float64) {
+func (l *sessionLogger) route(owner, sessionID, tunnelID string, action RouteAction, steamAppID, dstIP string, confidence float64) {
 	c := confidence
 	l.emit(sessionEvent{
 		Event:      "session.route",
 		Owner:      owner,
 		SessionID:  sessionID,
+		TunnelID:   tunnelID,
 		Action:     string(action),
 		SteamAppID: steamAppID,
 		DstIP:      dstIP,
@@ -87,16 +89,17 @@ func (l *sessionLogger) route(owner, sessionID string, action RouteAction, steam
 	})
 }
 
-func (l *sessionLogger) dnsBypass(owner, sessionID, dstIP string) {
-	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, DstIP: dstIP})
+func (l *sessionLogger) dnsBypass(owner, sessionID, tunnelID, dstIP string) {
+	l.emit(sessionEvent{Event: "session.dns_bypass", Owner: owner, SessionID: sessionID, TunnelID: tunnelID, DstIP: dstIP})
 }
 
-func (l *sessionLogger) dnsQuery(owner, sessionID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, bytesOut, headroom int) {
+func (l *sessionLogger) dnsQuery(owner, sessionID, tunnelID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, bytesOut, headroom int) {
 	in, out, hr := bytesIn, bytesOut, headroom
 	l.emit(sessionEvent{
 		Event:      "session.dns_query",
 		Owner:      owner,
 		SessionID:  sessionID,
+		TunnelID:   tunnelID,
 		DstIP:      dstIP,
 		QName:      qname,
 		QType:      qtype,
@@ -109,12 +112,13 @@ func (l *sessionLogger) dnsQuery(owner, sessionID, dstIP, qname, qtype, reason, 
 	})
 }
 
-func (l *sessionLogger) dnsResponse(owner, sessionID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, rcode int) {
+func (l *sessionLogger) dnsResponse(owner, sessionID, tunnelID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, rcode int) {
 	in, rc := bytesIn, rcode
 	l.emit(sessionEvent{
 		Event:      "session.dns_response",
 		Owner:      owner,
 		SessionID:  sessionID,
+		TunnelID:   tunnelID,
 		DstIP:      dstIP,
 		QName:      qname,
 		QType:      qtype,
@@ -126,14 +130,14 @@ func (l *sessionLogger) dnsResponse(owner, sessionID, dstIP, qname, qtype, reaso
 	})
 }
 
-func (l *sessionLogger) dnsError(owner, sessionID, dstIP, direction, reason string) {
+func (l *sessionLogger) dnsError(owner, sessionID, tunnelID, dstIP, direction, reason string) {
 	l.emit(sessionEvent{
 		Event:     "session.dns_error",
 		Owner:     owner,
 		SessionID: sessionID,
+		TunnelID:  tunnelID,
 		DstIP:     dstIP,
-		Action:    direction,
+		Direction: direction,
 		Reason:    reason,
 	})
 }
-

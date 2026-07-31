@@ -6,8 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,7 +382,7 @@ func (c *stubPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func TestEDNSPacketConnRewritesReadNotWrite(t *testing.T) {
 	raw := packDNSQuestion(t)
 	inner := &stubPacketConn{readPayload: raw}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
 
 	// Query path (client → resolver): ReadPacket must inject session.
 	readBuf := buf.NewPacket()
@@ -464,7 +467,7 @@ func TestEDNSPacketConnStripsTCPFrameOnQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &stubPacketConn{readPayload: framed}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
 
 	readBuf := buf.NewPacket()
 	defer readBuf.Release()
@@ -540,4 +543,84 @@ func TestDecisionFailKeepsSnapshot(t *testing.T) {
 	if d2 == nil || band2 != BandHigh || d2.SteamAppID != "1086940" {
 		t.Fatalf("want stale HIGH kept, got %#v band=%v", d2, band2)
 	}
+}
+
+type captureLogger struct {
+	testLogger
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *captureLogger) Info(args ...any) {
+	l.mu.Lock()
+	l.msgs = append(l.msgs, fmt.Sprint(args...))
+	l.mu.Unlock()
+}
+
+func (l *captureLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.msgs {
+		if strings.Contains(m, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+type flakyOwnerStore struct {
+	Store
+	failOwner bool
+}
+
+func (s *flakyOwnerStore) GetOwnerSession(ctx context.Context, owner string) (string, error) {
+	if s.failOwner {
+		return "", errors.New("redis down")
+	}
+	return s.Store.GetOwnerSession(ctx, owner)
+}
+
+func TestRedisErrorEmitsBindReject(t *testing.T) {
+	base := newMockStore(&option.TurbineMockOptions{Enabled: true})
+	store := &flakyOwnerStore{Store: base, failOwner: true}
+	log := &captureLogger{}
+	om := newOwnerManager(log, store, time.Hour, time.Hour, newSessionLogger(log))
+	defer om.Close()
+	om.Touch("user1", "1.2.3.4:12345")
+	if om.SessionID("user1") != "" {
+		t.Fatal("expected empty session on redis error")
+	}
+	if !log.contains(`"event":"session.bind.reject"`) || !log.contains(`"reason":"redis_error"`) {
+		t.Fatalf("expected bind.reject redis_error, logs=%v", log.msgs)
+	}
+}
+
+func TestOwnerSessionMissingReason(t *testing.T) {
+	base := newMockStore(&option.TurbineMockOptions{Enabled: true})
+	log := &captureLogger{}
+	om := newOwnerManager(log, base, time.Hour, time.Hour, newSessionLogger(log))
+	defer om.Close()
+	om.Touch("missing-user", "src:1")
+	if !log.contains(`"reason":"owner_session_missing"`) {
+		t.Fatalf("expected owner_session_missing, logs=%v", log.msgs)
+	}
+}
+
+func TestIdleTTLUnbindReason(t *testing.T) {
+	base := newMockStore(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"user1": "sess1"},
+	})
+	log := &captureLogger{}
+	om := newOwnerManager(log, base, 10*time.Millisecond, 20*time.Millisecond, newSessionLogger(log))
+	defer om.Close()
+	om.Touch("user1", "src:1")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if log.contains(`"reason":"idle_ttl"`) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected idle_ttl unbind, logs=%v", log.msgs)
 }

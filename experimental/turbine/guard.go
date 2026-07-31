@@ -115,28 +115,31 @@ func (g *Guard) dnsBypassTCP(metadata adapter.InboundContext) error {
 
 func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundContext) N.PacketConn {
 	owner := metadata.User
+	tunnelID := tunnelIDFrom(metadata)
 	g.logDNSBypass(metadata)
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	}, g.events, owner)
+	}, g.events, owner, tunnelID)
 }
 
 func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {
 	owner := metadata.User
-	g.owners.Touch(owner)
+	tunnelID := tunnelIDFrom(metadata)
+	g.owners.Touch(owner, tunnelID)
 	ip, _ := destinationAddrPort(metadata)
-	g.events.dnsBypass(owner, g.owners.SessionID(owner), canonicalizeIP(ip))
+	g.events.dnsBypass(owner, g.owners.SessionID(owner), tunnelID, canonicalizeIP(ip))
 }
 
 func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (RouteAction, error) {
 	ip, _ := destinationAddrPort(metadata)
 	owner := metadata.User
+	tunnelID := tunnelIDFrom(metadata)
 
-	st := g.owners.Touch(owner)
+	st := g.owners.Touch(owner, tunnelID)
 	sessionID := st.getSessionID()
 
 	if g.blacklist.Contains(ip) {
-		g.events.route(owner, sessionID, ActionRejected, "", canonicalizeIP(ip), 0)
+		g.events.route(owner, sessionID, tunnelID, ActionRejected, "", canonicalizeIP(ip), 0)
 		return ActionRejected, rejected()
 	}
 
@@ -159,11 +162,18 @@ func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (
 		action = ActionProxy
 	}
 
-	g.events.route(owner, sessionID, action, steamAppID, canonicalizeIP(ip), confidence)
+	g.events.route(owner, sessionID, tunnelID, action, steamAppID, canonicalizeIP(ip), confidence)
 	if action == ActionRejected {
 		return action, rejected()
 	}
 	return action, nil
+}
+
+func tunnelIDFrom(metadata adapter.InboundContext) string {
+	if metadata.Source.IsValid() {
+		return metadata.Source.String()
+	}
+	return ""
 }
 
 func destinationAddrPort(metadata adapter.InboundContext) (netip.Addr, uint16) {

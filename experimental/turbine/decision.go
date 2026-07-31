@@ -53,8 +53,6 @@ func newDecisionCache(logger logger.ContextLogger, store Store, ttlHigh, ttlLowU
 	}
 }
 
-func (c *DecisionCache) Threshold() float64 { return c.threshold }
-
 type lookupResult struct {
 	decision *IPDecision
 	band     ConfidenceBand
@@ -64,7 +62,7 @@ func (c *DecisionCache) Lookup(ctx context.Context, ip netip.Addr) (*IPDecision,
 	if !ip.IsValid() {
 		return nil, BandUnknown
 	}
-	key := canonicalizeIP(ip)
+	key := decisionIPKey(ip.Unmap())
 	now := time.Now()
 
 	c.mu.Lock()

@@ -2,14 +2,12 @@ package turbine
 
 import (
 	"bytes"
-	"encoding/binary"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 
 	"github.com/miekg/dns"
 	"github.com/sagernet/sing/common/buf"
@@ -26,6 +24,10 @@ type dnsIPSet struct {
 func newDNSIPSet(entries []string) *dnsIPSet {
 	s := &dnsIPSet{addrs: make(map[netip.AddrPort]struct{})}
 	for _, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
 		if ap, err := netip.ParseAddrPort(raw); err == nil {
 			s.addrs[netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())] = struct{}{}
 			continue
@@ -49,21 +51,56 @@ func isDNSBypass(dst netip.Addr, port uint16, pinned *dnsIPSet) bool {
 	return pinned.contains(dst, port)
 }
 
+type ednsReason string
+
+const (
+	ednsOK              ednsReason = "ok"
+	ednsUnchanged       ednsReason = "unchanged"
+	ednsSessionEmpty    ednsReason = "unchanged:session_empty"
+	ednsCapacity        ednsReason = "capacity"
+	ednsOKStripped      ednsReason = "ok:stripped_tcp_frame"
+	ednsStrippedPrefix             = "stripped_tcp_frame:"
+	ednsStripKeepPrefix            = "strip_keep_original:"
+)
+
+func (r ednsReason) String() string { return string(r) }
+
+func (r ednsReason) withStrip() ednsReason {
+	switch r {
+	case ednsOK:
+		return ednsOKStripped
+	default:
+		return ednsReason(ednsStrippedPrefix + string(r))
+	}
+}
+
+func (r ednsReason) needsHex() bool {
+	switch r {
+	case ednsOK, ednsOKStripped, ednsUnchanged:
+		return false
+	}
+	if strings.HasPrefix(string(r), ednsStrippedPrefix+string(ednsUnchanged)) ||
+		strings.HasPrefix(string(r), ednsStrippedPrefix+string(ednsSessionEmpty)) {
+		return false
+	}
+	return true
+}
+
 // rewriteEDNSSession sets or clears a private EDNS0 option carrying session_id.
 func rewriteEDNSSession(msg []byte, optionCode uint16, sessionID string) ([]byte, bool) {
 	out, reason := rewriteEDNSSessionDetail(msg, optionCode, sessionID)
-	return out, reason == "ok"
+	return out, reason == ednsOK
 }
 
-func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) ([]byte, string) {
+func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) ([]byte, ednsReason) {
 	var m dns.Msg
 	if err := m.Unpack(msg); err != nil {
-		return msg, "unpack_fail:" + err.Error()
+		return msg, ednsReason("unpack_fail:" + err.Error())
 	}
 	opt := m.IsEdns0()
 	if opt == nil {
 		if sessionID == "" {
-			return msg, "unchanged:session_empty"
+			return msg, ednsSessionEmpty
 		}
 		opt = new(dns.OPT)
 		opt.Hdr.Name = "."
@@ -87,88 +124,15 @@ func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) (
 	}
 	packed, err := m.Pack()
 	if err != nil {
-		return msg, "pack_fail:" + err.Error()
+		return msg, ednsReason("pack_fail:" + err.Error())
 	}
 	if bytes.Equal(packed, msg) {
 		if sessionID == "" {
-			return msg, "unchanged:session_empty"
+			return msg, ednsSessionEmpty
 		}
-		return msg, "unchanged"
+		return msg, ednsUnchanged
 	}
-	return packed, "ok"
-}
-
-// stripTCPDNSLengthPrefix detects DNS-over-TCP style 2-byte length prefix on a UDP payload.
-// Production captures showed clients sending "0028" + 40-byte DNS query to :5353.
-func stripTCPDNSLengthPrefix(msg []byte) ([]byte, bool) {
-	if len(msg) < 14 { // 2-byte len + 12-byte DNS header
-		return msg, false
-	}
-	declared := int(binary.BigEndian.Uint16(msg[:2]))
-	if declared != len(msg)-2 || declared < 12 {
-		return msg, false
-	}
-	body := msg[2:]
-	var m dns.Msg
-	if err := m.Unpack(body); err != nil {
-		return msg, false
-	}
-	return body, true
-}
-
-func prependTCPDNSLengthPrefix(msg []byte) []byte {
-	out := make([]byte, 2+len(msg))
-	binary.BigEndian.PutUint16(out[:2], uint16(len(msg)))
-	copy(out[2:], msg)
-	return out
-}
-
-// replaceBufferPayload rewrites buffer contents in place while preserving front headroom.
-// Resize(0, 0) would destroy headroom that hy2/tuic (and outbound writers) rely on.
-func replaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
-	start := buffer.Start()
-	need := start + len(rewritten)
-	if buffer.Cap() < need {
-		return false
-	}
-	buffer.Resize(start, 0)
-	n, err := buffer.Write(rewritten)
-	return err == nil && n == len(rewritten)
-}
-
-func dnsQuestionMeta(msg []byte) (qname, qtype string, rcode int) {
-	var m dns.Msg
-	if err := m.Unpack(msg); err != nil {
-		return "", "", -1
-	}
-	rcode = m.Rcode
-	if len(m.Question) > 0 {
-		q := m.Question[0]
-		return q.Name, dns.TypeToString[q.Qtype], rcode
-	}
-	return "", "", rcode
-}
-
-func peekDNSHeader(msg []byte) string {
-	if len(msg) < 12 {
-		return fmt.Sprintf("short:%d", len(msg))
-	}
-	id := binary.BigEndian.Uint16(msg[0:2])
-	flags := binary.BigEndian.Uint16(msg[2:4])
-	qd := binary.BigEndian.Uint16(msg[4:6])
-	an := binary.BigEndian.Uint16(msg[6:8])
-	ns := binary.BigEndian.Uint16(msg[8:10])
-	ar := binary.BigEndian.Uint16(msg[10:12])
-	return fmt.Sprintf("id=%d qr=%d opcode=%d rcode=%d qd=%d an=%d ns=%d ar=%d",
-		id, flags>>15, (flags>>11)&0xF, flags&0xF, qd, an, ns, ar)
-}
-
-func payloadHex(msg []byte) string {
-	const max = 128
-	if len(msg) <= max {
-		return hex.EncodeToString(msg)
-	}
-	return hex.EncodeToString(msg[:max]) + "..."
+	return packed, ednsOK
 }
 
 type ednsPacketConn struct {
@@ -177,16 +141,18 @@ type ednsPacketConn struct {
 	sessionIDFunc func() string
 	events        *sessionLogger
 	owner         string
+	tunnelID      string
 	tcpFramed     bool // client sent DNS-over-TCP length prefix over UDP
 }
 
-func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner string) N.PacketConn {
+func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner, tunnelID string) N.PacketConn {
 	return &ednsPacketConn{
 		PacketConn:    conn,
 		optionCode:    optionCode,
 		sessionIDFunc: sessionIDFunc,
 		events:        events,
 		owner:         owner,
+		tunnelID:      tunnelID,
 	}
 }
 
@@ -228,7 +194,7 @@ func (c *ednsPacketConn) CreateReadWaiter() (N.PacketReadWaiter, bool) {
 	readWaiter, ok := bufio.CreatePacketReadWaiter(c.PacketConn)
 	if !ok {
 		if c.events != nil {
-			c.events.dnsError(c.owner, c.sessionID(), "", "wait_reader", "unavailable_fallback_readpacket")
+			c.events.dnsError(c.owner, c.sessionID(), c.tunnelID, "", "wait_reader", "unavailable_fallback_readpacket")
 		}
 		return nil, false
 	}
@@ -273,35 +239,30 @@ func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksadd
 	header := peekDNSHeader(dnsMsg)
 
 	rewritten, reason := rewriteEDNSSessionDetail(dnsMsg, c.optionCode, sessionID)
-	if framed && reason != "ok" {
-		// Still forward unwrapped DNS even when EDNS rewrite is a no-op / session empty.
+	switch {
+	case framed && reason != ednsOK:
 		if !replaceBufferPayload(buffer, dnsMsg) {
-			reason = "capacity"
-		} else if reason == "unchanged" || reason == "unchanged:session_empty" {
-			reason = "stripped_tcp_frame:" + reason
+			reason = ednsCapacity
 		} else {
-			reason = "stripped_tcp_frame:" + reason
+			reason = reason.withStrip()
 		}
-	} else if reason == "ok" {
+	case reason == ednsOK:
 		if !replaceBufferPayload(buffer, rewritten) {
-			reason = "capacity"
+			reason = ednsCapacity
 		} else if framed {
-			reason = "ok:stripped_tcp_frame"
+			reason = ednsOKStripped
 		}
-	} else if framed {
-		// unpack of inner message failed after strip? shouldn't happen; keep original
-		reason = "strip_keep_original:" + reason
+	case framed:
+		reason = ednsReason(ednsStripKeepPrefix + string(reason))
 	}
 
 	bytesOut := buffer.Len()
 	if c.events != nil {
 		hexStr := ""
-		if reason != "ok" && reason != "ok:stripped_tcp_frame" &&
-			reason != "unchanged" && reason != "stripped_tcp_frame:unchanged" &&
-			reason != "stripped_tcp_frame:unchanged:session_empty" {
+		if reason.needsHex() {
 			hexStr = payloadHex(payload)
 		}
-		c.events.dnsQuery(c.owner, sessionID, dstIP, qname, qtype, reason, header, hexStr, bytesIn, bytesOut, headroom)
+		c.events.dnsQuery(c.owner, sessionID, c.tunnelID, dstIP, qname, qtype, reason.String(), header, hexStr, bytesIn, bytesOut, headroom)
 	}
 }
 
@@ -316,7 +277,7 @@ func (c *ednsPacketConn) logResponse(buffer *buf.Buffer, destination M.Socksaddr
 	if len(payload) <= 32 || rcode != 0 {
 		hexStr = payloadHex(payload)
 	}
-	c.events.dnsResponse(c.owner, c.sessionID(), dstIP, qname, qtype, "passthrough", peekDNSHeader(payload), hexStr, len(payload), rcode)
+	c.events.dnsResponse(c.owner, c.sessionID(), c.tunnelID, dstIP, qname, qtype, "passthrough", peekDNSHeader(payload), hexStr, len(payload), rcode)
 }
 
 func (c *ednsPacketConn) logError(destination M.Socksaddr, direction string, err error) {
@@ -327,7 +288,7 @@ func (c *ednsPacketConn) logError(destination M.Socksaddr, direction string, err
 	if destination.IsValid() {
 		dstIP = destination.Addr.Unmap().String()
 	}
-	c.events.dnsError(c.owner, c.sessionID(), dstIP, direction, err.Error())
+	c.events.dnsError(c.owner, c.sessionID(), c.tunnelID, dstIP, direction, err.Error())
 }
 
 func isBenignPacketErr(err error) bool {

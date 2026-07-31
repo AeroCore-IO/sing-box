@@ -3,6 +3,7 @@ package turbine
 import (
 	"context"
 	"net/netip"
+	"strings"
 )
 
 type AllowSet struct {
@@ -65,6 +66,16 @@ func bandOf(confidence float64, threshold float64) ConfidenceBand {
 	return BandLow
 }
 
+// decisionIPKey builds Redis decision:{ip} key material.
+// Spec: literal IP string with trim only (callers should pass the wire/dst addr as observed).
+func decisionIPKey(ip netip.Addr) string {
+	if !ip.IsValid() {
+		return ""
+	}
+	return strings.TrimSpace(ip.String())
+}
+
+// canonicalizeIP keeps a stable display/log form (unmap IPv4-mapped).
 func canonicalizeIP(ip netip.Addr) string {
 	if !ip.IsValid() {
 		return ""

@@ -82,7 +82,7 @@ func (s *mockStore) GetAllow(_ context.Context, sessionID string) (*AllowSet, er
 func (s *mockStore) GetDecision(_ context.Context, ip netip.Addr) (*IPDecision, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	d := s.decisions[canonicalizeIP(ip)]
+	d := s.decisions[decisionIPKey(ip.Unmap())]
 	if d == nil {
 		return nil, nil
 	}

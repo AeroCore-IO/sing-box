@@ -3,11 +3,13 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type TurbineOptions struct {
-	Enabled               bool                       `json:"enabled,omitempty"`
-	Redis                 *TurbineRedisOptions       `json:"redis,omitempty"`
-	AllowPollInterval     badoption.Duration         `json:"allow_poll_interval,omitempty"`
-	ThresholdT            float64                    `json:"threshold_t,omitempty"`
-	DecisionCache         *TurbineDecisionCache      `json:"decision_cache,omitempty"`
+	Enabled           bool                 `json:"enabled,omitempty"`
+	Redis             *TurbineRedisOptions `json:"redis,omitempty"`
+	AllowPollInterval badoption.Duration   `json:"allow_poll_interval,omitempty"`
+	// ThresholdT is the confidence cutoff for HIGH vs LOW bands (default 0.70).
+	ThresholdT    float64               `json:"threshold_t,omitempty"`
+	DecisionCache *TurbineDecisionCache `json:"decision_cache,omitempty"`
+	// HKDNSResolverIPs are DNS bypass destinations: "ip:port" (bare IP => :53).
 	HKDNSResolverIPs      badoption.Listable[string] `json:"hk_dns_resolver_ips,omitempty"`
 	EDNSSessionOptionCode uint16                     `json:"edns_session_option_code,omitempty"`
 	UserStateIdleTTL      badoption.Duration         `json:"user_state_idle_ttl,omitempty"`

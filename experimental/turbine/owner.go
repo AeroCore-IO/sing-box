@@ -8,15 +8,22 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
+const allowPollHeartbeat = 60 * time.Second
+
 type userState struct {
-	owner            string
-	sessionID        string
-	allow            map[string]struct{}
-	allowOKOnce      bool
+	owner string
+	// tunnelID is the best-effort correlation id (inbound source) for Grafana panels.
+	tunnelID  string
+	sessionID string
+	allow     map[string]struct{}
+	// hasAllowSnapshot is true after at least one successful allow poll.
+	hasAllowSnapshot bool
 	allowUpdated     int64
 	lastBindOK       bool
-	bindRejectLogged bool
-	lastSeen time.Time
+	// rejectLogged rate-limits session.bind.reject for missing/redis errors.
+	rejectLogged bool
+	lastSeen     time.Time
+	lastPollOKAt time.Time
 
 	mu sync.Mutex
 }
@@ -84,12 +91,13 @@ func (m *OwnerManager) Close() {
 	m.wg.Wait()
 }
 
-func (m *OwnerManager) Touch(owner string) *userState {
+func (m *OwnerManager) Touch(owner, tunnelID string) *userState {
 	m.mu.Lock()
 	st, ok := m.users[owner]
 	if !ok {
 		st = &userState{
 			owner:    owner,
+			tunnelID: tunnelID,
 			allow:    make(map[string]struct{}),
 			lastSeen: time.Now(),
 		}
@@ -99,16 +107,21 @@ func (m *OwnerManager) Touch(owner string) *userState {
 		return st
 	}
 	m.mu.Unlock()
-	st.touch()
+	st.mu.Lock()
+	st.lastSeen = time.Now()
+	if tunnelID != "" {
+		st.tunnelID = tunnelID
+	}
+	st.mu.Unlock()
 	return st
 }
 
 func (m *OwnerManager) SessionID(owner string) string {
-	return m.Touch(owner).getSessionID()
+	return m.Touch(owner, "").getSessionID()
 }
 
 func (m *OwnerManager) InAllow(owner, steamAppID string) bool {
-	return m.Touch(owner).inAllow(steamAppID)
+	return m.Touch(owner, "").inAllow(steamAppID)
 }
 
 func (m *OwnerManager) loop(ctx context.Context) {
@@ -142,8 +155,14 @@ func (m *OwnerManager) resolveOwner(ctx context.Context, st *userState) {
 	sessionID, err := m.store.GetOwnerSession(ctx, st.owner)
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	tunnelID := st.tunnelID
 	if err != nil {
 		m.logger.Debug("turbine: owner_session lookup failed for ", st.owner, ": ", err)
+		// Fail-keep existing snapshot; surface redis_error once for ops visibility.
+		if !st.rejectLogged {
+			m.events.bindReject(st.owner, st.sessionID, tunnelID, "redis_error")
+			st.rejectLogged = true
+		}
 		return
 	}
 	if sessionID == "" {
@@ -151,26 +170,26 @@ func (m *OwnerManager) resolveOwner(ctx context.Context, st *userState) {
 		prev := st.sessionID
 		st.sessionID = ""
 		st.allow = make(map[string]struct{})
-		st.allowOKOnce = false
+		st.hasAllowSnapshot = false
 		st.lastBindOK = false
 		if hadSession {
-			m.events.unbind(st.owner, prev, "not_found")
-			st.bindRejectLogged = false
+			m.events.unbind(st.owner, prev, tunnelID, "not_found")
+			st.rejectLogged = false
 		}
-		if !st.bindRejectLogged {
-			m.events.bindReject(st.owner, "", "not_found")
-			st.bindRejectLogged = true
+		if !st.rejectLogged {
+			m.events.bindReject(st.owner, "", tunnelID, "owner_session_missing")
+			st.rejectLogged = true
 		}
 		return
 	}
 	prev := st.sessionID
 	changed := !st.lastBindOK || prev != sessionID
 	st.sessionID = sessionID
-	st.bindRejectLogged = false
+	st.rejectLogged = false
 	if changed {
-		m.events.bindOK(st.owner, sessionID)
+		m.events.bindOK(st.owner, sessionID, tunnelID)
 		st.lastBindOK = true
-		st.allowOKOnce = false
+		st.hasAllowSnapshot = false
 		st.allow = make(map[string]struct{})
 	} else {
 		st.lastBindOK = true
@@ -183,7 +202,8 @@ func (m *OwnerManager) pollOne(ctx context.Context, st *userState) {
 	st.mu.Lock()
 	sessionID := st.sessionID
 	owner := st.owner
-	allowOKOnce := st.allowOKOnce
+	tunnelID := st.tunnelID
+	hasSnapshot := st.hasAllowSnapshot
 	st.mu.Unlock()
 
 	if sessionID == "" {
@@ -195,14 +215,14 @@ func (m *OwnerManager) pollOne(ctx context.Context, st *userState) {
 
 	allow, err := m.store.GetAllow(ctx, sessionID)
 	if err != nil {
-		if allowOKOnce {
-			m.events.allowPollFail(owner, sessionID)
+		if hasSnapshot {
+			m.events.allowPollFail(owner, sessionID, tunnelID)
 		}
 		return
 	}
 	if allow == nil {
-		if allowOKOnce {
-			m.events.allowPollFail(owner, sessionID)
+		if hasSnapshot {
+			m.events.allowPollFail(owner, sessionID, tunnelID)
 			return
 		}
 		st.mu.Lock()
@@ -215,10 +235,10 @@ func (m *OwnerManager) pollOne(ctx context.Context, st *userState) {
 		prev := st.sessionID
 		st.sessionID = ""
 		st.allow = make(map[string]struct{})
-		st.allowOKOnce = false
+		st.hasAllowSnapshot = false
 		st.lastBindOK = false
 		st.mu.Unlock()
-		m.events.unbind(owner, prev, "owner_drift")
+		m.events.unbind(owner, prev, tunnelID, "owner_drift")
 		return
 	}
 
@@ -230,17 +250,24 @@ func (m *OwnerManager) pollOne(ctx context.Context, st *userState) {
 		}
 	}
 
+	now := time.Now()
 	st.mu.Lock()
 	changed := !allowSetEqual(st.allow, newSet)
+	heartbeat := !st.lastPollOKAt.IsZero() && now.Sub(st.lastPollOKAt) >= allowPollHeartbeat
+	firstOK := !st.hasAllowSnapshot
 	st.allow = newSet
-	st.allowOKOnce = true
+	st.hasAllowSnapshot = true
 	st.allowUpdated = allow.UpdatedAt
 	allowN := len(st.allow)
 	updatedAt := st.allowUpdated
+	shouldEmitOK := changed || firstOK || heartbeat || st.lastPollOKAt.IsZero()
+	if shouldEmitOK {
+		st.lastPollOKAt = now
+	}
 	st.mu.Unlock()
 
-	if changed {
-		m.events.allowPollOK(owner, sessionID, allowN, updatedAt)
+	if shouldEmitOK {
+		m.events.allowPollOK(owner, sessionID, tunnelID, allowN, updatedAt)
 	}
 }
 
@@ -264,12 +291,12 @@ func (m *OwnerManager) reapIdle() {
 		st.mu.Lock()
 		idle := now.Sub(st.lastSeen) > m.idleTTL
 		sessionID := st.sessionID
+		tunnelID := st.tunnelID
 		st.mu.Unlock()
 		if !idle {
 			continue
 		}
 		delete(m.users, owner)
-		m.events.unbind(owner, sessionID, "idle")
+		m.events.unbind(owner, sessionID, tunnelID, "idle_ttl")
 	}
 }
-

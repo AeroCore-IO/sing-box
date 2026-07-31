@@ -66,7 +66,7 @@ func (s *redisStore) GetAllow(ctx context.Context, sessionID string) (*AllowSet,
 }
 
 func (s *redisStore) GetDecision(ctx context.Context, ip netip.Addr) (*IPDecision, error) {
-	key := keyDecisionPrefix + canonicalizeIP(ip)
+	key := keyDecisionPrefix + decisionIPKey(ip.Unmap())
 	val, err := s.client.Get(ctx, key).Result()
 	if err == redis.Nil {
 		return nil, nil
