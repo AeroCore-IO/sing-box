@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 type testLogger struct{}
@@ -504,6 +505,131 @@ func TestEDNSPacketConnStripsTCPFrameOnQuery(t *testing.T) {
 	if len(inner.wrote) < 2 || binary.BigEndian.Uint16(inner.wrote[:2]) != uint16(len(inner.wrote)-2) {
 		t.Fatalf("response should be TCP-framed for client, got hex=%x", inner.wrote)
 	}
+}
+
+func TestReplaceBufferPayloadFailsOnTightCap(t *testing.T) {
+	raw := packDNSQuestion(t)
+	rewritten, ok := rewriteEDNSSession(raw, 65001, "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78")
+	if !ok {
+		t.Fatal("expected rewrite")
+	}
+	if len(rewritten) <= len(raw) {
+		t.Fatalf("rewritten should grow: raw=%d rewritten=%d", len(raw), len(rewritten))
+	}
+	// Simulate TUIC zero-copy: Cap == Len == packet size.
+	tight := buf.As(append([]byte(nil), raw...))
+	if replaceBufferPayload(tight, rewritten) {
+		t.Fatal("tight Cap must fail in-place replace")
+	}
+	grown, ok := replaceOrGrowBuffer(tight, rewritten)
+	if !ok {
+		t.Fatal("grow fallback should succeed")
+	}
+	defer grown.Release()
+	if !hasEDNSSession(grown.Bytes(), 65001, "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78") {
+		t.Fatal("grown buffer missing session")
+	}
+}
+
+func TestReplaceOrGrowBufferReclaimsReservedRear(t *testing.T) {
+	raw := packDNSQuestion(t)
+	rewritten, ok := rewriteEDNSSession(raw, 65001, "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78")
+	if !ok {
+		t.Fatal("expected rewrite")
+	}
+	growth := len(rewritten) - len(raw)
+	if growth <= 0 {
+		t.Fatal("expected growth")
+	}
+	buffer := buf.NewSize(len(raw) + growth + 16)
+	if _, err := buffer.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	buffer.Reserve(growth + 16)
+	if replaceBufferPayload(buffer, rewritten) {
+		t.Fatal("reserved rear must make in-place replace fail")
+	}
+	out, ok := replaceOrGrowBuffer(buffer, rewritten)
+	if !ok {
+		t.Fatal("OverCap reclaim should succeed without NewPacket")
+	}
+	defer out.Release()
+	if out != buffer {
+		t.Fatal("expected same buffer after reclaim, not grow")
+	}
+	if !hasEDNSSession(out.Bytes(), 65001, "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78") {
+		t.Fatal("reclaimed buffer missing session")
+	}
+}
+
+func TestEDNSReadWaiterForcesRearHeadroom(t *testing.T) {
+	inner := &stubPacketConn{readPayload: packDNSQuestion(t)}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	edns := conn.(*ednsPacketConn)
+	w := &ednsPacketReadWaiter{conn: edns, readWaiter: &stubPacketReadWaiter{payload: packDNSQuestion(t)}}
+	needCopy := w.InitializeReadWaiter(N.ReadWaitOptions{})
+	if !needCopy {
+		t.Fatal("empty options should become NeedHeadroom after bump")
+	}
+	if w.readWaiter.(*stubPacketReadWaiter).opts.RearHeadroom < ednsRewriteRearHeadroom {
+		t.Fatalf("RearHeadroom=%d", w.readWaiter.(*stubPacketReadWaiter).opts.RearHeadroom)
+	}
+}
+
+func TestEDNSWaitReadPacketGrowsTightBuffer(t *testing.T) {
+	sessionID := "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78"
+	raw := packDNSQuestionWithEmptySession(t)
+	innerWait := &stubPacketReadWaiter{payload: raw, tightCap: true}
+	conn := &ednsPacketConn{
+		optionCode:    65001,
+		sessionIDFunc: func() string { return sessionID },
+	}
+	w := &ednsPacketReadWaiter{conn: conn, readWaiter: innerWait}
+	buffer, _, err := w.WaitReadPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buffer.Release()
+	if !hasEDNSSession(buffer.Bytes(), 65001, sessionID) {
+		t.Fatalf("session not injected, len=%d hex=%x", buffer.Len(), buffer.Bytes())
+	}
+}
+
+func packDNSQuestionWithEmptySession(t *testing.T) []byte {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetQuestion("albiononline.com.", dns.TypeA)
+	m.SetEdns0(1232, false)
+	opt := m.IsEdns0()
+	opt.Option = append(opt.Option, &dns.EDNS0_LOCAL{Code: 65001, Data: nil})
+	raw, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// stubPacketReadWaiter returns a fixed DNS payload; optional tightCap mimics TUIC zero-copy Cap==Len.
+type stubPacketReadWaiter struct {
+	payload  []byte
+	tightCap bool
+	opts     N.ReadWaitOptions
+}
+
+func (w *stubPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	w.opts = options
+	return options.NeedHeadroom()
+}
+
+func (w *stubPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	destination = M.SocksaddrFrom(netip.MustParseAddr("10.7.76.121"), 5353)
+	if w.tightCap {
+		buffer = buf.As(append([]byte(nil), w.payload...))
+		return buffer, destination, nil
+	}
+	buffer = buf.NewPacket()
+	_, err = buffer.Write(w.payload)
+	return buffer, destination, err
 }
 
 type flakyDecisionStore struct {

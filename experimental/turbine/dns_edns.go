@@ -135,6 +135,10 @@ func rewriteEDNSSessionDetail(msg []byte, optionCode uint16, sessionID string) (
 	return packed, ednsOK
 }
 
+// ednsRewriteRearHeadroom reserves space to inject session_id into EDNS (sess_* UUID ~41B + OPT overhead).
+// Without this, TUIC zero-copy WaitReadPacket returns Cap==Len buffers and rewrite fails with reason=capacity.
+const ednsRewriteRearHeadroom = 128
+
 type ednsPacketConn struct {
 	N.PacketConn
 	optionCode    uint16
@@ -170,7 +174,8 @@ func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr
 		c.logError(destination, "read", err)
 		return
 	}
-	c.rewriteQuery(buffer, destination)
+	// Caller owns buffer; cannot swap pointer — Cap must already be sufficient (CopyPacketWithPool).
+	c.rewriteQuery(buffer, destination, false)
 	return
 }
 
@@ -207,6 +212,11 @@ type ednsPacketReadWaiter struct {
 }
 
 func (w *ednsPacketReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	// NewReadWaitOptions only inspects the outbound destination; DNS direct has no rear headroom.
+	// Force copy / reserved Cap so EDNS session rewrite can grow the query.
+	if options.RearHeadroom < ednsRewriteRearHeadroom {
+		options.RearHeadroom = ednsRewriteRearHeadroom
+	}
 	return w.readWaiter.InitializeReadWaiter(options)
 }
 
@@ -216,11 +226,13 @@ func (w *ednsPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination
 		w.conn.logError(destination, "wait_read", err)
 		return
 	}
-	w.conn.rewriteQuery(buffer, destination)
+	buffer = w.conn.rewriteQuery(buffer, destination, true)
 	return
 }
 
-func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksaddr) {
+// rewriteQuery injects session_id into the DNS query.
+// When allowGrow is true (WaitReadPacket), a tight Cap==Len buffer may be replaced with a larger one.
+func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksaddr, allowGrow bool) *buf.Buffer {
 	sessionID := c.sessionID()
 	payload := buffer.Bytes()
 	bytesIn := len(payload)
@@ -239,15 +251,24 @@ func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksadd
 	header := peekDNSHeader(dnsMsg)
 
 	rewritten, reason := rewriteEDNSSessionDetail(dnsMsg, c.optionCode, sessionID)
+	apply := func(payload []byte) bool {
+		var ok bool
+		if allowGrow {
+			buffer, ok = replaceOrGrowBuffer(buffer, payload)
+		} else {
+			ok = replaceBufferPayload(buffer, payload)
+		}
+		return ok
+	}
 	switch {
 	case framed && reason != ednsOK:
-		if !replaceBufferPayload(buffer, dnsMsg) {
+		if !apply(dnsMsg) {
 			reason = ednsCapacity
 		} else {
 			reason = reason.withStrip()
 		}
 	case reason == ednsOK:
-		if !replaceBufferPayload(buffer, rewritten) {
+		if !apply(rewritten) {
 			reason = ednsCapacity
 		} else if framed {
 			reason = ednsOKStripped
@@ -264,6 +285,7 @@ func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksadd
 		}
 		c.events.dnsQuery(c.owner, sessionID, c.tunnelID, dstIP, qname, qtype, reason.String(), header, hexStr, bytesIn, bytesOut, headroom)
 	}
+	return buffer
 }
 
 func (c *ednsPacketConn) logResponse(buffer *buf.Buffer, destination M.Socksaddr) {
