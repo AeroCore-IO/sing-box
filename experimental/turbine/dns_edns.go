@@ -180,12 +180,35 @@ func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr
 }
 
 // WritePacket is the reverse path (resolver → client). Re-frame if client used TCP length prefix.
+//
+// Go's net.Resolver uses dnsStreamRoundTrip when Dial returns a net.Conn that is not a
+// PacketConn (Hysteria2/TUIC UDP wrappers). Those clients send and expect the 2-byte
+// DNS-over-TCP length prefix even on UDP associations. If re-framing fails and we
+// forward a raw UDP response, the client treats the DNS ID as a length and blocks
+// until timeout (radar availability.turbine_dns).
+//
+// Outbound UDP reads often use Cap==Len buffers; in-place prepend can fail. Grow via
+// OverCap when possible. Otherwise write a framed copy and Release the caller's
+// buffer: CopyPacketWithPool transfers ownership to WritePacket, and the inner
+// conn only Releases the buffer it is given.
 func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	c.logResponse(buffer, destination)
 	if c.tcpFramed {
 		framed := prependTCPDNSLengthPrefix(buffer.Bytes())
-		if !replaceBufferPayload(buffer, framed) {
-			c.logError(destination, "write_frame", errors.New("capacity"))
+		if !tryReplaceBufferPayload(buffer, framed) {
+			tmp := buf.NewPacket()
+			defer tmp.Release()
+			if _, err := tmp.Write(framed); err != nil {
+				c.logError(destination, "write_frame", err)
+				return err
+			}
+			err := c.PacketConn.WritePacket(tmp, destination)
+			if err != nil {
+				c.logError(destination, "write", err)
+				return err
+			}
+			buffer.Release()
+			return nil
 		}
 	}
 	err := c.PacketConn.WritePacket(buffer, destination)

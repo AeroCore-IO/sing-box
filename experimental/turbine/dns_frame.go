@@ -45,17 +45,25 @@ func replaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
 	return err == nil && n == len(rewritten)
 }
 
-// replaceOrGrowBuffer writes rewritten into buffer, or into a new packet buffer when Cap is too small
-// (TUIC zero-copy Cap==Len). Tries reclaiming reserved rear Cap first. On grow success the old buffer is Released.
-func replaceOrGrowBuffer(buffer *buf.Buffer, rewritten []byte) (*buf.Buffer, bool) {
+// tryReplaceBufferPayload rewrites in place, reclaiming reserved rear Cap via OverCap.
+func tryReplaceBufferPayload(buffer *buf.Buffer, rewritten []byte) bool {
 	if replaceBufferPayload(buffer, rewritten) {
-		return buffer, true
+		return true
 	}
 	if raw := buffer.RawCap(); raw > buffer.Cap() {
 		buffer.OverCap(raw - buffer.Cap())
 		if replaceBufferPayload(buffer, rewritten) {
-			return buffer, true
+			return true
 		}
+	}
+	return false
+}
+
+// replaceOrGrowBuffer writes rewritten into buffer, or into a new packet buffer when Cap is too small
+// (TUIC zero-copy Cap==Len). Tries reclaiming reserved rear Cap first. On grow success the old buffer is Released.
+func replaceOrGrowBuffer(buffer *buf.Buffer, rewritten []byte) (*buf.Buffer, bool) {
+	if tryReplaceBufferPayload(buffer, rewritten) {
+		return buffer, true
 	}
 	grown := buf.NewPacket()
 	start := buffer.Start()

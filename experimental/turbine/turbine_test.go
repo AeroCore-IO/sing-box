@@ -507,6 +507,102 @@ func TestEDNSPacketConnStripsTCPFrameOnQuery(t *testing.T) {
 	}
 }
 
+func TestEDNSPacketConnReframeResponseTightCap(t *testing.T) {
+	framed, err := hex.DecodeString("0028e65701000001000000000001076578616d706c6503636f6d000001000100002904d0000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &stubPacketConn{readPayload: framed}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+
+	readBuf := buf.NewPacket()
+	defer readBuf.Release()
+	if _, err := conn.ReadPacket(readBuf); err != nil {
+		t.Fatal(err)
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	req.Id = 0xe657
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	rawResp, err := resp.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cap==Len==RawCap mimics pooled UDP reads with no rear; copy write must still frame
+	// and Release the caller buffer (CopyPacketWithPool transfers ownership).
+	tight := buf.NewSize(len(rawResp))
+	if _, err := tight.Write(rawResp); err != nil {
+		t.Fatal(err)
+	}
+	if tight.Cap() != tight.Len() || tight.RawCap() != tight.Cap() {
+		t.Fatalf("expected Cap==Len==RawCap, cap=%d len=%d raw=%d", tight.Cap(), tight.Len(), tight.RawCap())
+	}
+	if err := conn.WritePacket(tight, M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53)); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.wrote) < 2 || binary.BigEndian.Uint16(inner.wrote[:2]) != uint16(len(inner.wrote)-2) {
+		t.Fatalf("tight-cap response must still be TCP-framed, got hex=%x", inner.wrote)
+	}
+	if !bytes.Equal(inner.wrote[2:], rawResp) {
+		t.Fatal("framed payload mismatch")
+	}
+	if tight.Len() != 0 {
+		t.Fatal("original buffer must be released after framed copy write")
+	}
+}
+
+func TestEDNSPacketConnReframeResponseOverCap(t *testing.T) {
+	framed, err := hex.DecodeString("0028e65701000001000000000001076578616d706c6503636f6d000001000100002904d0000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &stubPacketConn{readPayload: framed}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+
+	readBuf := buf.NewPacket()
+	defer readBuf.Release()
+	if _, err := conn.ReadPacket(readBuf); err != nil {
+		t.Fatal(err)
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	req.Id = 0xe657
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	rawResp, err := resp.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const extra = 16
+	buffer := buf.NewSize(len(rawResp) + 2 + extra)
+	defer buffer.Release()
+	if _, err := buffer.Write(rawResp); err != nil {
+		t.Fatal(err)
+	}
+	buffer.Reserve(2 + extra)
+	if buffer.Cap() != buffer.Len() {
+		t.Fatalf("expected reserved rear Cap==Len, cap=%d len=%d", buffer.Cap(), buffer.Len())
+	}
+	if buffer.RawCap() <= buffer.Cap() {
+		t.Fatal("expected RawCap > Cap after Reserve")
+	}
+	if err := conn.WritePacket(buffer, M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53)); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner.wrote) < 2 || binary.BigEndian.Uint16(inner.wrote[:2]) != uint16(len(inner.wrote)-2) {
+		t.Fatalf("overcap response must be TCP-framed, got hex=%x", inner.wrote)
+	}
+	if !bytes.Equal(inner.wrote[2:], rawResp) {
+		t.Fatal("framed payload mismatch")
+	}
+	if !bytes.Equal(buffer.Bytes(), inner.wrote) {
+		t.Fatal("OverCap reclaim should rewrite in place")
+	}
+}
+
 func TestReplaceBufferPayloadFailsOnTightCap(t *testing.T) {
 	raw := packDNSQuestion(t)
 	rewritten, ok := rewriteEDNSSession(raw, 65001, "sess_d44f21ca-2493-48c2-bcb2-409cf93b3c78")
