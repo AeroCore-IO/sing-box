@@ -15,6 +15,13 @@ permissions:
 #   - hysteria2 user bandwidth limiting added (fixed + dynamic token bucket at application layer)
 #   - tuic protocol added http auth support
 #   - tuic user bandwidth limiting added (fixed + dynamic token bucket at application layer)
+#   - experimental turbine connection guard with confidence-based routing (acceleration / proxy / reject)
+#   - Redis storage for owner session, allow-list and IP decisions (mock mode supported)
+#   - destination IP/CIDR blacklist
+#   - EDNS session option injection for DNS-over-UDP (default option code 65001)
+#   - DNS-over-UDP TCP length prefix strip/reframe with buffer growth for tight/over-cap packets
+#   - DNS resolver bypass with ip:port matching
+#   - tunnel ID tracking and structured session logging
 # --------------------------------------------------
 jobs:
   release:
