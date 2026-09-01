@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
@@ -38,7 +39,7 @@ type Inbound struct {
 	listener           *listener.Listener
 	tlsConfig          tls.ServerConfig
 	server             *tuic.Service[string]
-	userBandwidthStore *userBandwidthStore
+	userBandwidthStore *ratelimit.UserStore
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
@@ -54,7 +55,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter:            inbound.NewAdapter(C.TypeTUIC, tag),
 		router:             uot.NewRouter(router, logger),
 		logger:             logger,
-		userBandwidthStore: newUserBandwidthStore(),
+		userBandwidthStore: ratelimit.NewUserStore(),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
@@ -76,9 +77,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 				Timeout: C.TCPTimeout,
 			},
 			logger: logger,
-			onAuthResult: func(userID string, upKbps *int, downKbps *int) {
-				inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
-			},
 		}
 	}
 	service, err := tuic.NewService[string](tuic.ServiceOptions{
@@ -93,7 +91,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Handler:           inbound,
 		Authenticator:     authenticator,
 		OnAuthSuccess: func(userID string, upKbps *int, downKbps *int) {
-			inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
+			inbound.userBandwidthStore.UpdateDynamic(userID, ratelimit.Override{UpKbps: upKbps, DownKbps: downKbps})
 		},
 	})
 	if err != nil {
@@ -110,10 +108,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		if err != nil {
 			return nil, E.Cause(err, "invalid uuid for user ", user.Name)
 		}
-		userList = append(userList, user.Name)
+		userName := user.Name
+		if userName == "" {
+			userName = user.UUID
+		}
+		userList = append(userList, userName)
 		userUUIDList = append(userUUIDList, userUUID)
 		userPasswordList = append(userPasswordList, user.Password)
-		inbound.userBandwidthStore.SetFixed(user.Name, user.UpKbps, user.DownKbps)
+		inbound.userBandwidthStore.SetFixed(userName, user.UpKbps, user.DownKbps)
 	}
 	service.UpdateUsers(userList, userUUIDList, userPasswordList)
 	inbound.server = service
@@ -139,9 +141,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
-	if userLimit := h.userBandwidthStore.Load(userName); userLimit.enabled() {
-		conn = newRateLimitConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
-	}
+	conn = ratelimit.WrapConn(conn, h.userBandwidthStore.Load(userName))
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -164,9 +164,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
 	}
-	if userLimit := h.userBandwidthStore.Load(userName); userLimit.enabled() {
-		conn = newRateLimitPacketConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
-	}
+	conn = ratelimit.WrapPacketConn(conn, h.userBandwidthStore.Load(userName))
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -196,10 +194,9 @@ func (h *Inbound) Close() error {
 }
 
 type httpAuthenticator struct {
-	url          string
-	client       *http.Client
-	logger       log.ContextLogger
-	onAuthResult func(userID string, upKbps *int, downKbps *int)
+	url    string
+	client *http.Client
+	logger log.ContextLogger
 }
 
 func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int) {
@@ -233,9 +230,6 @@ func (a *httpAuthenticator) Authenticate(addr string, uuid string, tx uint64) (s
 	if err != nil {
 		a.logger.Error("http auth response error: ", err)
 		return "", false, "", nil, nil
-	}
-	if response.OK && a.onAuthResult != nil {
-		a.onAuthResult(response.ID, response.UpKbps, response.DownKbps)
 	}
 	return response.ID, response.OK, response.Password, response.UpKbps, response.DownKbps
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -13,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -38,7 +40,7 @@ type Inbound struct {
 	listener           *listener.Listener
 	tlsConfig          tls.ServerConfig
 	service            *hysteria2.Service[string]
-	userBandwidthStore *userBandwidthStore
+	userBandwidthStore *ratelimit.UserStore
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -103,7 +105,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter:            inbound.NewAdapter(C.TypeHysteria2, tag),
 		router:             router,
 		logger:             logger,
-		userBandwidthStore: newUserBandwidthStore(),
+		userBandwidthStore: ratelimit.NewUserStore(),
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
@@ -127,7 +129,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			logger: logger,
 			cache:  cache.New[string, cachedAuthResult](cache.WithSize[string, cachedAuthResult](1024)),
 			onAuthResult: func(userID string, upKbps *int, downKbps *int) {
-				inbound.userBandwidthStore.UpdateDynamic(userID, upKbps, downKbps)
+				inbound.userBandwidthStore.UpdateDynamic(userID, ratelimit.Override{UpKbps: upKbps, DownKbps: downKbps})
 			},
 		}
 	}
@@ -151,9 +153,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	userList := make([]string, 0, len(options.Users))
 	userPasswordList := make([]string, 0, len(options.Users))
 	for _, user := range options.Users {
-		userList = append(userList, user.Name)
+		userID := userName(user.Name, user.Password)
+		userList = append(userList, userID)
 		userPasswordList = append(userPasswordList, user.Password)
-		inbound.userBandwidthStore.SetFixed(user.Name, user.UpKbps, user.DownKbps)
+		inbound.userBandwidthStore.SetFixed(userID, user.UpKbps, user.DownKbps)
 	}
 	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
@@ -179,9 +182,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
-	if userLimit := h.userBandwidthStore.Load(userID); userLimit.enabled() {
-		conn = newRateLimitConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
-	}
+	conn = ratelimit.WrapConn(conn, h.userBandwidthStore.Load(userID))
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -204,9 +205,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
 	}
-	if userLimit := h.userBandwidthStore.Load(userID); userLimit.enabled() {
-		conn = newRateLimitPacketConn(conn, ctx, userLimit.upBPS, userLimit.downBPS)
-	}
+	conn = ratelimit.WrapPacketConn(conn, h.userBandwidthStore.Load(userID))
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -283,7 +282,7 @@ func (a *httpAuthenticator) Authenticate(addr string, auth string, tx uint64) (s
 		UpKbps   *int   `json:"up_kbps,omitempty"`
 		DownKbps *int   `json:"down_kbps,omitempty"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&response)
+	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&response)
 	if err != nil {
 		a.logger.Error("http auth response error: ", err)
 		return "", false
