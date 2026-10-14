@@ -27,6 +27,10 @@ type DecisionCache struct {
 	mu    sync.Mutex
 	cache map[string]cacheEntry
 	group singleflight.Group
+
+	destMu     sync.Mutex
+	dest       DestIndex
+	destExpire time.Time
 }
 
 func newDecisionCache(logger logger.ContextLogger, store Store, ttlHigh, ttlLowUnknown, ttlNegative time.Duration, threshold float64) *DecisionCache {
@@ -69,6 +73,9 @@ func (c *DecisionCache) Lookup(ctx context.Context, ip netip.Addr) (*IPDecision,
 	if e, ok := c.cache[key]; ok && now.Before(e.expire) {
 		c.mu.Unlock()
 		if e.negative || e.decision == nil {
+			if hit := c.destLookup(ctx, ip); hit != nil {
+				return hit, bandOf(hit.Confidence, c.threshold)
+			}
 			return nil, BandUnknown
 		}
 		return e.decision, bandOf(e.decision.Confidence, c.threshold)
@@ -114,6 +121,9 @@ func (c *DecisionCache) fetch(ctx context.Context, key string, ip netip.Addr, st
 		c.mu.Lock()
 		c.cache[key] = cacheEntry{negative: true, expire: now.Add(c.ttlLowUnknown)}
 		c.mu.Unlock()
+		if hit := c.destLookup(ctx, ip); hit != nil {
+			return lookupResult{decision: hit, band: bandOf(hit.Confidence, c.threshold)}
+		}
 		return lookupResult{band: BandUnknown}
 	}
 
@@ -126,4 +136,35 @@ func (c *DecisionCache) fetch(ctx context.Context, key string, ip netip.Addr, st
 	c.cache[key] = cacheEntry{decision: d, expire: now.Add(ttl)}
 	c.mu.Unlock()
 	return lookupResult{decision: d, band: band}
+}
+
+func (c *DecisionCache) destLookup(ctx context.Context, ip netip.Addr) *IPDecision {
+	now := time.Now()
+	c.destMu.Lock()
+	if now.Before(c.destExpire) {
+		idx := c.dest
+		c.destMu.Unlock()
+		return idx.lookup(ip)
+	}
+	c.destMu.Unlock()
+
+	idx, err := c.store.GetDestIndex(ctx)
+	c.destMu.Lock()
+	defer c.destMu.Unlock()
+	if err != nil {
+		c.logger.Debug("turbine: dest index lookup failed: ", err)
+		if now.Before(c.destExpire) {
+			return c.dest.lookup(ip)
+		}
+		c.destExpire = now.Add(c.ttlNegative)
+		return nil
+	}
+	if idx == nil {
+		c.dest = DestIndex{}
+	} else {
+		c.dest = *idx
+	}
+	c.dest.compile()
+	c.destExpire = now.Add(c.ttlLowUnknown)
+	return c.dest.lookup(ip)
 }

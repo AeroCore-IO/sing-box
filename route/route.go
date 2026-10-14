@@ -151,7 +151,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	for _, guard := range r.guards {
 		var guardErr error
-		conn, guardErr = guard.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+		conn, guardErr = guard.RoutedConnection(ctx, conn, &metadata, selectedRule, selectedOutbound)
 		if guardErr != nil {
 			return guardErr
 		}
@@ -284,7 +284,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	for _, guard := range r.guards {
 		var guardErr error
-		conn, guardErr = guard.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
+		conn, guardErr = guard.RoutedPacketConnection(ctx, conn, &metadata, selectedRule, selectedOutbound)
 		if guardErr != nil {
 			return guardErr
 		}

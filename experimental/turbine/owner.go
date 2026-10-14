@@ -24,6 +24,9 @@ type userState struct {
 	rejectLogged bool
 	lastSeen     time.Time
 	lastPollOKAt time.Time
+	// legacy is true after a successful owner_session GET returned empty.
+	// Redis errors leave this false so evaluate stays proxy-only.
+	legacy bool
 
 	mu sync.Mutex
 }
@@ -38,6 +41,12 @@ func (u *userState) getSessionID() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.sessionID
+}
+
+func (u *userState) sessionAndLegacy() (string, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.sessionID, u.legacy
 }
 
 func (u *userState) inAllow(steamAppID string) bool {
@@ -158,7 +167,7 @@ func (m *OwnerManager) resolveOwner(ctx context.Context, st *userState) {
 	tunnelID := st.tunnelID
 	if err != nil {
 		m.logger.Debug("turbine: owner_session lookup failed for ", st.owner, ": ", err)
-		// Fail-keep existing snapshot; surface redis_error once for ops visibility.
+		// Fail-keep existing snapshot; redis_error is not legacy.
 		if !st.rejectLogged {
 			m.events.bindReject(st.owner, st.sessionID, tunnelID, "redis_error")
 			st.rejectLogged = true
@@ -169,6 +178,7 @@ func (m *OwnerManager) resolveOwner(ctx context.Context, st *userState) {
 		hadSession := st.sessionID != "" || st.lastBindOK
 		prev := st.sessionID
 		st.sessionID = ""
+		st.legacy = true
 		st.allow = make(map[string]struct{})
 		st.hasAllowSnapshot = false
 		st.lastBindOK = false
@@ -185,6 +195,7 @@ func (m *OwnerManager) resolveOwner(ctx context.Context, st *userState) {
 	prev := st.sessionID
 	changed := !st.lastBindOK || prev != sessionID
 	st.sessionID = sessionID
+	st.legacy = false
 	st.rejectLogged = false
 	if changed {
 		m.events.bindOK(st.owner, sessionID, tunnelID)
@@ -234,6 +245,7 @@ func (m *OwnerManager) pollOne(ctx context.Context, st *userState) {
 		st.mu.Lock()
 		prev := st.sessionID
 		st.sessionID = ""
+		st.legacy = false
 		st.allow = make(map[string]struct{})
 		st.hasAllowSnapshot = false
 		st.lastBindOK = false

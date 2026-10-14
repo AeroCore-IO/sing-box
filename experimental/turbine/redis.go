@@ -16,6 +16,7 @@ const (
 	keyOwnerSessionPrefix = "owner_session:"
 	keyAllowPrefix        = "allow:"
 	keyDecisionPrefix     = "decision:"
+	keyDestIndex          = "wl:dest"
 )
 
 type redisStore struct {
@@ -79,6 +80,22 @@ func (s *redisStore) GetDecision(ctx context.Context, ip netip.Addr) (*IPDecisio
 		return nil, fmt.Errorf("turbine: decode decision: %w", err)
 	}
 	return &d, nil
+}
+
+func (s *redisStore) GetDestIndex(ctx context.Context) (*DestIndex, error) {
+	val, err := s.client.Get(ctx, keyDestIndex).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var idx DestIndex
+	if err := json.Unmarshal([]byte(val), &idx); err != nil {
+		return nil, fmt.Errorf("turbine: decode dest index: %w", err)
+	}
+	idx.compile()
+	return &idx, nil
 }
 
 func (s *redisStore) Close() error {

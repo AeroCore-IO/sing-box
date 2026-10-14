@@ -2,6 +2,7 @@ package turbine
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"strings"
 )
@@ -18,6 +19,36 @@ type IPDecision struct {
 	SteamAppID string  `json:"steam_app_id"`
 	Confidence float64 `json:"confidence"`
 	UpdatedAt  int64   `json:"updated_at"`
+}
+
+type DestHit struct {
+	SteamAppID string  `json:"steam_app_id"`
+	Confidence float64 `json:"confidence"`
+}
+
+type DestCIDR struct {
+	CIDR       string  `json:"cidr"`
+	SteamAppID string  `json:"steam_app_id"`
+	Confidence float64 `json:"confidence"`
+	Priority   int     `json:"priority"`
+}
+
+type destNet struct {
+	network    *net.IPNet
+	steamAppID string
+	confidence float64
+	priority   int
+}
+
+// DestIndex is Redis wl:dest. Exact IPs take precedence over CIDRs.
+// SkipIPs are DIRECT-winning literals that must not fall through to a covering PROXY CIDR.
+type DestIndex struct {
+	IPs     map[string]DestHit `json:"ips,omitempty"`
+	CIDRs   []DestCIDR         `json:"cidrs,omitempty"`
+	SkipIPs []string           `json:"skip_ips,omitempty"`
+
+	skip     map[string]struct{}
+	cidrNets []destNet
 }
 
 type ConfidenceBand int
@@ -41,6 +72,7 @@ type Store interface {
 	GetOwnerSession(ctx context.Context, owner string) (sessionID string, err error)
 	GetAllow(ctx context.Context, sessionID string) (*AllowSet, error)
 	GetDecision(ctx context.Context, ip netip.Addr) (*IPDecision, error)
+	GetDestIndex(ctx context.Context) (*DestIndex, error)
 	Close() error
 }
 

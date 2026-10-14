@@ -36,6 +36,25 @@ type TurbineMockOptions struct {
 	OwnerSessions map[string]string              `json:"owner_sessions,omitempty"`
 	Allows        map[string]TurbineMockAllow    `json:"allows,omitempty"`
 	Decisions     map[string]TurbineMockDecision `json:"decisions,omitempty"`
+	DestIndex     *TurbineMockDestIndex          `json:"dest_index,omitempty"`
+}
+
+type TurbineMockDestIndex struct {
+	IPs     map[string]TurbineMockDestHit `json:"ips,omitempty"`
+	CIDRs   []TurbineMockDestCIDR         `json:"cidrs,omitempty"`
+	SkipIPs []string                      `json:"skip_ips,omitempty"`
+}
+
+type TurbineMockDestHit struct {
+	SteamAppID string  `json:"steam_app_id,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+type TurbineMockDestCIDR struct {
+	CIDR       string  `json:"cidr,omitempty"`
+	SteamAppID string  `json:"steam_app_id,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
+	Priority   int     `json:"priority,omitempty"`
 }
 
 type TurbineMockAllow struct {

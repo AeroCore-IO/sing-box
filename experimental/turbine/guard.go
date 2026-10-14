@@ -10,20 +10,22 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
 var _ adapter.ConnectionGuard = (*Guard)(nil)
 
 type Guard struct {
-	logger    logger.ContextLogger
-	store     Store
-	owners    *OwnerManager
-	decisions *DecisionCache
-	blacklist *Blacklist
-	dnsIPs    *dnsIPSet
-	ednsCode  uint16
-	events    *sessionLogger
+	logger      logger.ContextLogger
+	store       Store
+	owners      *OwnerManager
+	decisions   *DecisionCache
+	blacklist   *Blacklist
+	dnsIPs      *dnsIPSet
+	dnsRedirect netip.AddrPort
+	ednsCode    uint16
+	events      *sessionLogger
 }
 
 func NewGuard(logger logger.ContextLogger, options option.TurbineOptions) *Guard {
@@ -60,36 +62,37 @@ func NewGuard(logger logger.ContextLogger, options option.TurbineOptions) *Guard
 	}
 
 	return &Guard{
-		logger:    logger,
-		store:     store,
-		owners:    newOwnerManager(logger, store, poll, idle, events),
-		decisions: newDecisionCache(logger, store, ttlHigh, ttlLow, ttlNeg, threshold),
-		blacklist: newBlacklist(logger, options.Blacklist),
-		dnsIPs:    newDNSIPSet(options.HKDNSResolverIPs),
-		ednsCode:  ednsCode,
-		events:    events,
+		logger:      logger,
+		store:       store,
+		owners:      newOwnerManager(logger, store, poll, idle, events),
+		decisions:   newDecisionCache(logger, store, ttlHigh, ttlLow, ttlNeg, threshold),
+		blacklist:   newBlacklist(logger, options.Blacklist),
+		dnsIPs:      newDNSIPSet(options.HKDNSResolverIPs),
+		dnsRedirect: firstDNSRedirect(options.HKDNSResolverIPs),
+		ednsCode:    ednsCode,
+		events:      events,
 	}
 }
 
-func (g *Guard) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) (net.Conn, error) {
-	if !g.shouldHandle(metadata) {
+func (g *Guard) RoutedConnection(ctx context.Context, conn net.Conn, metadata *adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) (net.Conn, error) {
+	if metadata == nil || !g.shouldHandle(*metadata) {
 		return conn, nil
 	}
-	if g.isDNSBypass(metadata) {
+	if g.isDNSBypass(*metadata) {
 		return conn, g.dnsBypassTCP(metadata)
 	}
-	_, err := g.evaluate(ctx, metadata)
+	_, err := g.evaluate(ctx, *metadata)
 	return conn, err
 }
 
-func (g *Guard) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) (N.PacketConn, error) {
-	if !g.shouldHandle(metadata) {
+func (g *Guard) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata *adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) (N.PacketConn, error) {
+	if metadata == nil || !g.shouldHandle(*metadata) {
 		return conn, nil
 	}
-	if g.isDNSBypass(metadata) {
-		return g.wrapDNSBypassUDP(conn, metadata), nil
+	if g.isDNSBypass(*metadata) {
+		return g.wrapDNSBypassUDP(conn, *metadata), nil
 	}
-	if _, err := g.evaluate(ctx, metadata); err != nil {
+	if _, err := g.evaluate(ctx, *metadata); err != nil {
 		return conn, err
 	}
 	return conn, nil
@@ -104,12 +107,25 @@ func (g *Guard) shouldHandle(metadata adapter.InboundContext) bool {
 
 func (g *Guard) isDNSBypass(metadata adapter.InboundContext) bool {
 	ip, port := destinationAddrPort(metadata)
-	return isDNSBypass(ip, port, g.dnsIPs)
+	if isDNSBypass(ip, port, g.dnsIPs) {
+		return true
+	}
+	return isPublicDNSQuery(ip, port)
 }
 
-// dnsBypassTCP keeps owner state warm; EDNS rewrite is UDP-only.
-func (g *Guard) dnsBypassTCP(metadata adapter.InboundContext) error {
-	g.logDNSBypass(metadata)
+// dnsBypassTCP keeps owner state warm and rewrites public :53 to the first HK DNS
+// resolver. The outbound is already selected; mutating Destination is the only
+// way TCP hijack reaches HK DNS.
+func (g *Guard) dnsBypassTCP(metadata *adapter.InboundContext) error {
+	if metadata == nil {
+		return nil
+	}
+	g.logDNSBypass(*metadata)
+	ip, port := destinationAddrPort(*metadata)
+	if g.dnsIPs.contains(ip, port) || !g.dnsRedirect.IsValid() {
+		return nil
+	}
+	metadata.Destination = M.SocksaddrFrom(g.dnsRedirect.Addr(), g.dnsRedirect.Port())
 	return nil
 }
 
@@ -117,9 +133,14 @@ func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundCont
 	owner := metadata.User
 	tunnelID := tunnelIDFrom(metadata)
 	g.logDNSBypass(metadata)
+	ip, port := destinationAddrPort(metadata)
+	var redirect netip.AddrPort
+	if !g.dnsIPs.contains(ip, port) {
+		redirect = g.dnsRedirect
+	}
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	}, g.events, owner, tunnelID)
+	}, g.events, owner, tunnelID, redirect)
 }
 
 func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {
@@ -136,7 +157,7 @@ func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (
 	tunnelID := tunnelIDFrom(metadata)
 
 	st := g.owners.Touch(owner, tunnelID)
-	sessionID := st.getSessionID()
+	sessionID, legacy := st.sessionAndLegacy()
 
 	if g.blacklist.Contains(ip) {
 		g.events.route(owner, sessionID, tunnelID, ActionRejected, "", canonicalizeIP(ip), 0)
@@ -151,12 +172,12 @@ func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (
 		confidence = decision.Confidence
 	}
 
-	inAllow := steamAppID != "" && st.inAllow(steamAppID)
+	inAllow := steamAppID != "" && (legacy || st.inAllow(steamAppID))
 	var action RouteAction
 	switch {
 	case band == BandHigh && inAllow:
 		action = ActionAcceleration
-	case band == BandLow && inAllow:
+	case band == BandLow && inAllow && !legacy:
 		action = ActionRejected
 	default:
 		action = ActionProxy
@@ -210,6 +231,10 @@ func (s *errStore) GetAllow(context.Context, string) (*AllowSet, error) {
 }
 
 func (s *errStore) GetDecision(context.Context, netip.Addr) (*IPDecision, error) {
+	return nil, s.err
+}
+
+func (s *errStore) GetDestIndex(context.Context) (*DestIndex, error) {
 	return nil, s.err
 }
 

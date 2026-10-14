@@ -51,6 +51,30 @@ func isDNSBypass(dst netip.Addr, port uint16, pinned *dnsIPSet) bool {
 	return pinned.contains(dst, port)
 }
 
+func isPublicDNSQuery(ip netip.Addr, port uint16) bool {
+	if port != 53 || !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsMulticast() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast()
+}
+
+func firstDNSRedirect(entries []string) netip.AddrPort {
+	for _, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if ap, err := netip.ParseAddrPort(raw); err == nil {
+			return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+		}
+		if a, err := netip.ParseAddr(raw); err == nil {
+			return netip.AddrPortFrom(a.Unmap(), 53)
+		}
+	}
+	return netip.AddrPort{}
+}
+
 type ednsReason string
 
 const (
@@ -147,9 +171,10 @@ type ednsPacketConn struct {
 	owner         string
 	tunnelID      string
 	tcpFramed     bool // client sent DNS-over-TCP length prefix over UDP
+	redirect      netip.AddrPort
 }
 
-func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner, tunnelID string) N.PacketConn {
+func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner, tunnelID string, redirect netip.AddrPort) N.PacketConn {
 	return &ednsPacketConn{
 		PacketConn:    conn,
 		optionCode:    optionCode,
@@ -157,6 +182,7 @@ func wrapEDNSPacketConn(conn N.PacketConn, optionCode uint16, sessionIDFunc func
 		events:        events,
 		owner:         owner,
 		tunnelID:      tunnelID,
+		redirect:      redirect,
 	}
 }
 
@@ -176,6 +202,7 @@ func (c *ednsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr
 	}
 	// Caller owns buffer; cannot swap pointer — Cap must already be sufficient (CopyPacketWithPool).
 	c.rewriteQuery(buffer, destination, false)
+	destination = c.redirectDest(destination)
 	return
 }
 
@@ -250,7 +277,15 @@ func (w *ednsPacketReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination
 		return
 	}
 	buffer = w.conn.rewriteQuery(buffer, destination, true)
+	destination = w.conn.redirectDest(destination)
 	return
+}
+
+func (c *ednsPacketConn) redirectDest(destination M.Socksaddr) M.Socksaddr {
+	if !c.redirect.IsValid() {
+		return destination
+	}
+	return M.SocksaddrFrom(c.redirect.Addr(), c.redirect.Port())
 }
 
 // rewriteQuery injects session_id into the DNS query.

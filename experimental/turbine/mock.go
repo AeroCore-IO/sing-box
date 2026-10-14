@@ -13,6 +13,8 @@ type mockStore struct {
 	ownerSessions map[string]string
 	allows        map[string]*AllowSet
 	decisions     map[string]*IPDecision
+	dest          DestIndex
+	ownerErr      error
 }
 
 func newMockStore(options *option.TurbineMockOptions) *mockStore {
@@ -51,6 +53,19 @@ func newMockStore(options *option.TurbineMockOptions) *mockStore {
 		}
 		s.decisions[ip] = dec
 	}
+	if options.DestIndex != nil {
+		s.dest.IPs = make(map[string]DestHit, len(options.DestIndex.IPs))
+		for ip, hit := range options.DestIndex.IPs {
+			s.dest.IPs[ip] = DestHit{SteamAppID: hit.SteamAppID, Confidence: hit.Confidence}
+		}
+		for _, c := range options.DestIndex.CIDRs {
+			s.dest.CIDRs = append(s.dest.CIDRs, DestCIDR{
+				CIDR: c.CIDR, SteamAppID: c.SteamAppID, Confidence: c.Confidence, Priority: c.Priority,
+			})
+		}
+		s.dest.SkipIPs = append([]string(nil), options.DestIndex.SkipIPs...)
+		s.dest.compile()
+	}
 	return s
 }
 
@@ -64,6 +79,9 @@ func mockEnabled(options option.TurbineOptions) (*mockStore, bool) {
 func (s *mockStore) GetOwnerSession(_ context.Context, owner string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.ownerErr != nil {
+		return "", s.ownerErr
+	}
 	return s.ownerSessions[owner], nil
 }
 
@@ -87,6 +105,24 @@ func (s *mockStore) GetDecision(_ context.Context, ip netip.Addr) (*IPDecision, 
 		return nil, nil
 	}
 	cp := *d
+	return &cp, nil
+}
+
+func (s *mockStore) GetDestIndex(_ context.Context) (*DestIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.dest.IPs == nil && len(s.dest.CIDRs) == 0 && len(s.dest.SkipIPs) == 0 {
+		return nil, nil
+	}
+	cp := DestIndex{
+		IPs:     make(map[string]DestHit, len(s.dest.IPs)),
+		CIDRs:   append([]DestCIDR(nil), s.dest.CIDRs...),
+		SkipIPs: append([]string(nil), s.dest.SkipIPs...),
+	}
+	for k, v := range s.dest.IPs {
+		cp.IPs[k] = v
+	}
+	cp.compile()
 	return &cp, nil
 }
 
@@ -115,4 +151,10 @@ func (s *mockStore) setDecision(ip string, d *IPDecision) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.decisions[ip] = d
+}
+
+func (s *mockStore) setOwnerErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ownerErr = err
 }

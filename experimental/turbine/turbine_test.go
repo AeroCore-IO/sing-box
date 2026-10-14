@@ -171,6 +171,50 @@ func TestOwnerMissingIsProxy(t *testing.T) {
 	}
 }
 
+func TestOwnerMissingHighDecisionIsAcceleration(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		Decisions: map[string]option.TurbineMockDecision{
+			"5.45.187.119": {SteamAppID: "761890", Confidence: 0.9},
+		},
+	})
+	defer g.Close()
+	action, err := g.evaluate(context.Background(), meta("108", "5.45.187.119", 4535))
+	if err != nil || action != ActionAcceleration {
+		t.Fatalf("want acceleration, got %s err=%v", action, err)
+	}
+}
+
+func TestOwnerMissingLowDecisionIsProxy(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		Decisions: map[string]option.TurbineMockDecision{
+			"5.45.187.119": {SteamAppID: "761890", Confidence: 0.4},
+		},
+	})
+	defer g.Close()
+	action, err := g.evaluate(context.Background(), meta("108", "5.45.187.119", 4535))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("want proxy, got %s err=%v", action, err)
+	}
+}
+
+func TestOwnerMissingDestIndexIsAcceleration(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{
+				{CIDR: "5.45.187.0/24", SteamAppID: "761890", Confidence: 1, Priority: 1},
+			},
+		},
+	})
+	defer g.Close()
+	action, err := g.evaluate(context.Background(), meta("108", "5.45.187.118", 5055))
+	if err != nil || action != ActionAcceleration {
+		t.Fatalf("want acceleration, got %s err=%v", action, err)
+	}
+}
+
 func TestBlacklistRejected(t *testing.T) {
 	g := testGuard(&option.TurbineMockOptions{Enabled: true})
 	defer g.Close()
@@ -194,7 +238,8 @@ func TestDNSBypassSkipsDecision(t *testing.T) {
 	defer g.Close()
 	// DNS bypass is handled before evaluate; evaluate on DNS dest would still run session path.
 	// Verify the guard entry path skips reject for LOW∧allow on DNS IP.
-	err := g.dnsBypassTCP(meta("user1", "10.0.0.53", 53))
+	m := meta("user1", "10.0.0.53", 53)
+	err := g.dnsBypassTCP(&m)
 	if err != nil {
 		t.Fatalf("dns bypass should pass, err=%v", err)
 	}
@@ -233,6 +278,20 @@ func TestDNSBypassBareIPDefaultsPort53(t *testing.T) {
 	defer g.Close()
 	if !g.isDNSBypass(meta("user1", "10.0.0.53", 53)) {
 		t.Fatal("bare IP should default to port 53")
+	}
+}
+
+func TestPublicDNSQueryIsBypass(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{Enabled: true})
+	defer g.Close()
+	if !g.isDNSBypass(meta("108", "1.1.1.1", 53)) {
+		t.Fatal("public resolver :53 should bypass for old clients")
+	}
+	if g.isDNSBypass(meta("108", "1.1.1.1", 443)) {
+		t.Fatal("public :443 is not DNS")
+	}
+	if g.isDNSBypass(meta("108", "10.7.76.121", 53)) {
+		t.Fatal("private :53 should not hijack")
 	}
 }
 
@@ -362,10 +421,14 @@ func hasEDNSSession(raw []byte, code uint16, sessionID string) bool {
 type stubPacketConn struct {
 	readPayload []byte
 	wrote       []byte
+	readDest    M.Socksaddr
 }
 
 func (c *stubPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	_, err = buffer.Write(c.readPayload)
+	if c.readDest.IsValid() {
+		return c.readDest, err
+	}
 	return M.SocksaddrFrom(netip.MustParseAddr("10.0.0.53"), 53), err
 }
 
@@ -383,7 +446,7 @@ func (c *stubPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func TestEDNSPacketConnRewritesReadNotWrite(t *testing.T) {
 	raw := packDNSQuestion(t)
 	inner := &stubPacketConn{readPayload: raw}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "", netip.AddrPort{})
 
 	// Query path (client → resolver): ReadPacket must inject session.
 	readBuf := buf.NewPacket()
@@ -416,6 +479,26 @@ func TestEDNSPacketConnRewritesReadNotWrite(t *testing.T) {
 	}
 	if !bytes.Equal(inner.wrote, raw) {
 		t.Fatal("WritePacket should pass response through unchanged")
+	}
+}
+
+func TestEDNSRedirectsPublicDNS(t *testing.T) {
+	raw := packDNSQuestion(t)
+	inner := &stubPacketConn{
+		readPayload: raw,
+		readDest:    M.SocksaddrFrom(netip.MustParseAddr("1.1.1.1"), 53),
+	}
+	redir := netip.MustParseAddrPort("10.0.0.53:53")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "" }, nil, "108", "", redir)
+	readBuf := buf.NewPacket()
+	defer readBuf.Release()
+	readBuf.Resize(64, 0)
+	dest, err := conn.ReadPacket(readBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dest.Addr.Unmap().String() != "10.0.0.53" || dest.Port != 53 {
+		t.Fatalf("dest=%s", dest)
 	}
 }
 
@@ -468,7 +551,7 @@ func TestEDNSPacketConnStripsTCPFrameOnQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &stubPacketConn{readPayload: framed}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "", netip.AddrPort{})
 
 	readBuf := buf.NewPacket()
 	defer readBuf.Release()
@@ -513,7 +596,7 @@ func TestEDNSPacketConnReframeResponseTightCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &stubPacketConn{readPayload: framed}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "", netip.AddrPort{})
 
 	readBuf := buf.NewPacket()
 	defer readBuf.Release()
@@ -559,7 +642,7 @@ func TestEDNSPacketConnReframeResponseOverCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &stubPacketConn{readPayload: framed}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "", netip.AddrPort{})
 
 	readBuf := buf.NewPacket()
 	defer readBuf.Release()
@@ -660,7 +743,7 @@ func TestReplaceOrGrowBufferReclaimsReservedRear(t *testing.T) {
 
 func TestEDNSReadWaiterForcesRearHeadroom(t *testing.T) {
 	inner := &stubPacketConn{readPayload: packDNSQuestion(t)}
-	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "")
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, nil, "user1", "", netip.AddrPort{})
 	edns := conn.(*ednsPacketConn)
 	w := &ednsPacketReadWaiter{conn: edns, readWaiter: &stubPacketReadWaiter{payload: packDNSQuestion(t)}}
 	needCopy := w.InitializeReadWaiter(N.ReadWaitOptions{})
@@ -845,4 +928,99 @@ func TestIdleTTLUnbindReason(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected idle_ttl unbind, logs=%v", log.msgs)
+}
+
+func TestOwnerRedisErrorNotLegacy(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{
+				{CIDR: "5.45.187.0/24", SteamAppID: "761890", Confidence: 1, Priority: 1},
+			},
+		},
+	})
+	defer g.Close()
+	g.store.(*mockStore).setOwnerErr(errors.New("redis down"))
+	action, err := g.evaluate(context.Background(), meta("108", "5.45.187.118", 5055))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("redis error must not skip allow, got %s err=%v", action, err)
+	}
+}
+
+func TestDestIndexSkipIP(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled: true,
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{
+				{CIDR: "5.45.187.0/24", SteamAppID: "761890", Confidence: 1, Priority: 1},
+			},
+			SkipIPs: []string{"5.45.187.119"},
+		},
+	})
+	defer g.Close()
+	action, err := g.evaluate(context.Background(), meta("108", "5.45.187.119", 4535))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("skipped dest want proxy, got %s err=%v", action, err)
+	}
+	action, err = g.evaluate(context.Background(), meta("108", "5.45.187.118", 5055))
+	if err != nil || action != ActionAcceleration {
+		t.Fatalf("cidr dest want acceleration, got %s err=%v", action, err)
+	}
+}
+
+func TestDestIndexDoesNotPinOverRedisDecision(t *testing.T) {
+	g := NewGuard(testLogger{}, option.TurbineOptions{
+		Enabled:           true,
+		AllowPollInterval: badoption.Duration(50 * time.Millisecond),
+		UserStateIdleTTL:  badoption.Duration(time.Hour),
+		ThresholdT:        0.70,
+		HKDNSResolverIPs:  []string{"10.0.0.53:53"},
+		DecisionCache: &option.TurbineDecisionCache{
+			TTLHigh:       badoption.Duration(time.Hour),
+			TTLLowUnknown: badoption.Duration(time.Nanosecond),
+		},
+		Mock: &option.TurbineMockOptions{
+			Enabled:       true,
+			OwnerSessions: map[string]string{"user1": "sess1"},
+			Allows: map[string]option.TurbineMockAllow{
+				"sess1": {Owner: "user1", SteamAppIDs: []string{"761890"}},
+			},
+			DestIndex: &option.TurbineMockDestIndex{
+				IPs: map[string]option.TurbineMockDestHit{
+					"5.45.187.119": {SteamAppID: "761890", Confidence: 1},
+				},
+			},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "user1", "761890")
+	action, err := g.evaluate(context.Background(), meta("user1", "5.45.187.119", 4535))
+	if err != nil || action != ActionAcceleration {
+		t.Fatalf("dest fallback want acceleration, got %s err=%v", action, err)
+	}
+	g.store.(*mockStore).setDecision("5.45.187.119", &IPDecision{IP: "5.45.187.119", SteamAppID: "761890", Confidence: 0.4})
+	time.Sleep(2 * time.Millisecond)
+	action, err = g.evaluate(context.Background(), meta("user1", "5.45.187.119", 4535))
+	if !IsRejected(err) {
+		t.Fatalf("redis LOW should reject, got %s err=%v", action, err)
+	}
+}
+
+func TestDNSBypassTCPRewritesPublicDest(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{Enabled: true})
+	defer g.Close()
+	m := meta("108", "1.1.1.1", 53)
+	if err := g.dnsBypassTCP(&m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Destination.Addr.Unmap().String() != "10.0.0.53" || m.Destination.Port != 53 {
+		t.Fatalf("public :53 dest=%s", m.Destination)
+	}
+	pinned := meta("108", "10.0.0.53", 53)
+	if err := g.dnsBypassTCP(&pinned); err != nil {
+		t.Fatal(err)
+	}
+	if pinned.Destination.Addr.Unmap().String() != "10.0.0.53" || pinned.Destination.Port != 53 {
+		t.Fatalf("pinned HK dest rewritten: %s", pinned.Destination)
+	}
 }

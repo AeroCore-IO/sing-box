@@ -31,9 +31,11 @@ type Router interface {
 	ResetNetwork()
 }
 
+// ConnectionGuard inspects routed connections after outbound selection.
+// metadata is a pointer so a guard can rewrite Destination (TCP DNS hijack) before dial.
 type ConnectionGuard interface {
-	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) (net.Conn, error)
-	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) (N.PacketConn, error)
+	RoutedConnection(ctx context.Context, conn net.Conn, metadata *InboundContext, matchedRule Rule, matchOutbound Outbound) (net.Conn, error)
+	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata *InboundContext, matchedRule Rule, matchOutbound Outbound) (N.PacketConn, error)
 }
 
 type ConnectionTracker interface {
