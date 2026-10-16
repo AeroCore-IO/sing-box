@@ -447,7 +447,7 @@ func (c *ednsPacketConn) logResponse(buffer *buf.Buffer, destination M.Socksaddr
 	if len(payload) <= 32 || rcode != 0 {
 		hexStr = payloadHex(payload)
 	}
-	c.events.dnsResponse(c.owner, c.sessionID(), c.tunnelID, dstIP, qname, qtype, "passthrough", peekDNSHeader(payload), hexStr, len(payload), rcode)
+	c.events.dnsResponse(c.owner, c.sessionID(), c.tunnelID, dstIP, qname, qtype, "passthrough", peekDNSHeader(payload), hexStr, len(payload), rcode, dnsAnswerRecords(payload))
 }
 
 func (c *ednsPacketConn) logError(destination M.Socksaddr, direction string, err error) {

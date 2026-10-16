@@ -663,6 +663,51 @@ func TestEDNSRedirectsPublicDNS(t *testing.T) {
 	}
 }
 
+func TestDNSResponseLogsAnswerIPs(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("live.albiononline.com.", dns.TypeA)
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Answer = []dns.RR{
+		&dns.CNAME{
+			Hdr:    dns.RR_Header{Name: "live.albiononline.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 60},
+			Target: "live02.sg.albiononline.com.",
+		},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "live02.sg.albiononline.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP("154.81.15.20").To4(),
+		},
+		&dns.AAAA{
+			Hdr:  dns.RR_Header{Name: "live02.sg.albiononline.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+			AAAA: net.ParseIP("2001:db8::15"),
+		},
+	}
+	raw, err := resp.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := &captureLogger{}
+	inner := &stubPacketConn{}
+	conn := wrapEDNSPacketConn(inner, 65001, func() string { return "sess_abc" }, newSessionLogger(log), "108", "tun", netip.AddrPort{})
+	buffer := buf.NewPacket()
+	defer buffer.Release()
+	if _, err := buffer.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WritePacket(buffer, M.Socksaddr{Fqdn: "ns1.hk.dev.aerocore.com.cn", Port: 5353}); err != nil {
+		t.Fatal(err)
+	}
+	joined := log.joined()
+	for _, want := range []string{
+		`"qname":"live.albiononline.com."`,
+		`"answers":["cname:live02.sg.albiononline.com.","154.81.15.20","2001:db8::15"]`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in %s", want, joined)
+		}
+	}
+}
+
 func TestEDNSCachedPacketRewritesWithoutWaiterError(t *testing.T) {
 	raw := packDNSQuestion(t)
 	log := &captureLogger{}

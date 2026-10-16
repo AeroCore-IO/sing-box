@@ -91,6 +91,32 @@ func dnsQuestionMeta(msg []byte) (qname, qtype string, rcode int) {
 	return "", "", rcode
 }
 
+// dnsAnswerRecords lists answer-section CNAME targets and A/AAAA addresses.
+func dnsAnswerRecords(msg []byte) []string {
+	var m dns.Msg
+	if err := m.Unpack(msg); err != nil {
+		return nil
+	}
+	var out []string
+	for _, rr := range m.Answer {
+		switch v := rr.(type) {
+		case *dns.CNAME:
+			if v.Target != "" {
+				out = append(out, "cname:"+v.Target)
+			}
+		case *dns.A:
+			if ip := v.A.To4(); ip != nil {
+				out = append(out, ip.String())
+			}
+		case *dns.AAAA:
+			if v.AAAA != nil {
+				out = append(out, v.AAAA.String())
+			}
+		}
+	}
+	return out
+}
+
 func peekDNSHeader(msg []byte) string {
 	if len(msg) < 12 {
 		return fmt.Sprintf("short:%d", len(msg))

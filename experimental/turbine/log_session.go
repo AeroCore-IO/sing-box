@@ -30,6 +30,7 @@ type sessionEvent struct {
 	RCode      *int     `json:"rcode,omitempty"`
 	Header     string   `json:"dns_hdr,omitempty"`
 	PayloadHex string   `json:"payload_hex,omitempty"`
+	Answers    []string `json:"answers,omitempty"`
 }
 
 type sessionLogger struct {
@@ -112,7 +113,7 @@ func (l *sessionLogger) dnsQuery(owner, sessionID, tunnelID, dstIP, qname, qtype
 	})
 }
 
-func (l *sessionLogger) dnsResponse(owner, sessionID, tunnelID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, rcode int) {
+func (l *sessionLogger) dnsResponse(owner, sessionID, tunnelID, dstIP, qname, qtype, reason, header, payloadHex string, bytesIn, rcode int, answers []string) {
 	in, rc := bytesIn, rcode
 	l.emit(sessionEvent{
 		Event:      "session.dns_response",
@@ -127,6 +128,7 @@ func (l *sessionLogger) dnsResponse(owner, sessionID, tunnelID, dstIP, qname, qt
 		RCode:      &rc,
 		Header:     header,
 		PayloadHex: payloadHex,
+		Answers:    answers,
 	})
 }
 
