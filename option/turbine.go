@@ -10,6 +10,9 @@ type TurbineOptions struct {
 	ThresholdT    float64               `json:"threshold_t,omitempty"`
 	DecisionCache *TurbineDecisionCache `json:"decision_cache,omitempty"`
 	// HKDNSResolverIPs are DNS bypass destinations: "ip:port" (bare IP => :53).
+	// New-client FQDN dest ns1.hk.aerocore.com.cn:5353 (prod) or
+	// ns1.hk.dev.aerocore.com.cn:5353 (dev) is also bypassed and redirected
+	// to the first resolver in this list that listens on port 5353.
 	HKDNSResolverIPs      badoption.Listable[string] `json:"hk_dns_resolver_ips,omitempty"`
 	EDNSSessionOptionCode uint16                     `json:"edns_session_option_code,omitempty"`
 	UserStateIdleTTL      badoption.Duration         `json:"user_state_idle_ttl,omitempty"`

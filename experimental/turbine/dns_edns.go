@@ -1,7 +1,9 @@
 package turbine
 
 import (
+	stdbufio "bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -16,8 +18,17 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+// hkDNSPort is the new-client HK DNS port. Hosts are prod and dev resolvers.
+const hkDNSPort uint16 = 5353
+
+var hkDNSHosts = map[string]struct{}{
+	"ns1.hk.aerocore.com.cn":     {},
+	"ns1.hk.dev.aerocore.com.cn": {},
+}
+
 type dnsIPSet struct {
 	addrs map[netip.AddrPort]struct{}
+	order []netip.AddrPort
 }
 
 // newDNSIPSet accepts "ip:port" (IPv6 as "[addr]:port"). Bare IP defaults to port 53.
@@ -29,14 +40,22 @@ func newDNSIPSet(entries []string) *dnsIPSet {
 			continue
 		}
 		if ap, err := netip.ParseAddrPort(raw); err == nil {
-			s.addrs[netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())] = struct{}{}
+			s.add(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
 			continue
 		}
 		if a, err := netip.ParseAddr(raw); err == nil {
-			s.addrs[netip.AddrPortFrom(a.Unmap(), 53)] = struct{}{}
+			s.add(netip.AddrPortFrom(a.Unmap(), 53))
 		}
 	}
 	return s
+}
+
+func (s *dnsIPSet) add(ap netip.AddrPort) {
+	if _, ok := s.addrs[ap]; ok {
+		return
+	}
+	s.addrs[ap] = struct{}{}
+	s.order = append(s.order, ap)
 }
 
 func (s *dnsIPSet) contains(ip netip.Addr, port uint16) bool {
@@ -47,8 +66,34 @@ func (s *dnsIPSet) contains(ip netip.Addr, port uint16) bool {
 	return ok
 }
 
+func (s *dnsIPSet) redirectForPort(port uint16) netip.AddrPort {
+	if s == nil {
+		return netip.AddrPort{}
+	}
+	for _, ap := range s.order {
+		if ap.Port() == port {
+			return ap
+		}
+	}
+	return netip.AddrPort{}
+}
+
 func isDNSBypass(dst netip.Addr, port uint16, pinned *dnsIPSet) bool {
 	return pinned.contains(dst, port)
+}
+
+func normalizeDNSHost(host string) string {
+	host = strings.TrimSpace(host)
+	host = strings.TrimSuffix(host, ".")
+	return strings.ToLower(host)
+}
+
+func isHKDNSHostname(host string, port uint16) bool {
+	if port != hkDNSPort {
+		return false
+	}
+	_, ok := hkDNSHosts[normalizeDNSHost(host)]
+	return ok
 }
 
 func isPublicDNSQuery(ip netip.Addr, port uint16) bool {
@@ -376,4 +421,68 @@ func isBenignPacketErr(err error) bool {
 		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+type ednsStreamConn struct {
+	net.Conn
+	br            *stdbufio.Reader
+	pending       []byte
+	optionCode    uint16
+	sessionIDFunc func() string
+	events        *sessionLogger
+	owner         string
+	tunnelID      string
+	dstIP         string
+}
+
+func wrapEDNSStreamConn(conn net.Conn, optionCode uint16, sessionIDFunc func() string, events *sessionLogger, owner, tunnelID, dstIP string) net.Conn {
+	if conn == nil {
+		return nil
+	}
+	return &ednsStreamConn{
+		Conn:          conn,
+		br:            stdbufio.NewReader(conn),
+		optionCode:    optionCode,
+		sessionIDFunc: sessionIDFunc,
+		events:        events,
+		owner:         owner,
+		tunnelID:      tunnelID,
+		dstIP:         dstIP,
+	}
+}
+
+func (c *ednsStreamConn) sessionID() string {
+	if c.sessionIDFunc == nil {
+		return ""
+	}
+	return c.sessionIDFunc()
+}
+
+func (c *ednsStreamConn) Read(p []byte) (int, error) {
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
+	var hdr [2]byte
+	if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
+		return 0, err
+	}
+	ln := int(binary.BigEndian.Uint16(hdr[:]))
+	msg := make([]byte, ln)
+	if _, err := io.ReadFull(c.br, msg); err != nil {
+		return 0, err
+	}
+	sessionID := c.sessionID()
+	rewritten, reason := rewriteEDNSSessionDetail(msg, c.optionCode, sessionID)
+	framed := prependTCPDNSLengthPrefix(rewritten)
+	if c.events != nil {
+		qname, qtype, _ := dnsQuestionMeta(rewritten)
+		c.events.dnsQuery(c.owner, sessionID, c.tunnelID, c.dstIP, qname, qtype, reason.String(), peekDNSHeader(rewritten), "", len(msg), len(rewritten), 0)
+	}
+	n := copy(p, framed)
+	if n < len(framed) {
+		c.pending = framed[n:]
+	}
+	return n, nil
 }

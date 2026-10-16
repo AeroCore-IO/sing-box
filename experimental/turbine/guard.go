@@ -79,7 +79,13 @@ func (g *Guard) RoutedConnection(ctx context.Context, conn net.Conn, metadata *a
 		return conn, nil
 	}
 	if g.isDNSBypass(*metadata) {
-		return conn, g.dnsBypassTCP(metadata)
+		err := g.dnsBypassTCP(metadata)
+		owner := metadata.User
+		tunnelID := tunnelIDFrom(*metadata)
+		dstIP := canonicalizeIP(metadata.Destination.Addr)
+		return wrapEDNSStreamConn(conn, g.ednsCode, func() string {
+			return g.owners.SessionID(owner)
+		}, g.events, owner, tunnelID, dstIP), err
 	}
 	_, err := g.evaluate(ctx, *metadata)
 	return conn, err
@@ -110,22 +116,25 @@ func (g *Guard) isDNSBypass(metadata adapter.InboundContext) bool {
 	if isDNSBypass(ip, port, g.dnsIPs) {
 		return true
 	}
-	return isPublicDNSQuery(ip, port)
+	if isPublicDNSQuery(ip, port) {
+		return true
+	}
+	return isHKDNSHostname(destinationFQDN(metadata), port)
 }
 
-// dnsBypassTCP keeps owner state warm and rewrites public :53 to the first HK DNS
-// resolver. The outbound is already selected; mutating Destination is the only
-// way TCP hijack reaches HK DNS.
+// dnsBypassTCP keeps owner state warm and rewrites public :53 / HK DNS FQDN to
+// the matching HK DNS resolver. The outbound is already selected; mutating
+// Destination is the only way TCP hijack reaches HK DNS.
 func (g *Guard) dnsBypassTCP(metadata *adapter.InboundContext) error {
 	if metadata == nil {
 		return nil
 	}
 	g.logDNSBypass(*metadata)
-	ip, port := destinationAddrPort(*metadata)
-	if g.dnsIPs.contains(ip, port) || !g.dnsRedirect.IsValid() {
+	dest := g.dnsRewriteTarget(*metadata)
+	if !dest.IsValid() {
 		return nil
 	}
-	metadata.Destination = M.SocksaddrFrom(g.dnsRedirect.Addr(), g.dnsRedirect.Port())
+	metadata.Destination = M.SocksaddrFrom(dest.Addr(), dest.Port())
 	return nil
 }
 
@@ -133,14 +142,23 @@ func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundCont
 	owner := metadata.User
 	tunnelID := tunnelIDFrom(metadata)
 	g.logDNSBypass(metadata)
-	ip, port := destinationAddrPort(metadata)
-	var redirect netip.AddrPort
-	if !g.dnsIPs.contains(ip, port) {
-		redirect = g.dnsRedirect
-	}
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	}, g.events, owner, tunnelID, redirect)
+	}, g.events, owner, tunnelID, g.dnsRewriteTarget(metadata))
+}
+
+// dnsRewriteTarget is the HK DNS AddrPort to hijack toward, or invalid if the
+// destination is already a pinned resolver IP.
+func (g *Guard) dnsRewriteTarget(metadata adapter.InboundContext) netip.AddrPort {
+	host := destinationFQDN(metadata)
+	ip, port := destinationAddrPort(metadata)
+	if isHKDNSHostname(host, port) {
+		return g.dnsIPs.redirectForPort(hkDNSPort)
+	}
+	if g.dnsIPs.contains(ip, port) {
+		return netip.AddrPort{}
+	}
+	return g.dnsRedirect
 }
 
 func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {
@@ -148,7 +166,11 @@ func (g *Guard) logDNSBypass(metadata adapter.InboundContext) {
 	tunnelID := tunnelIDFrom(metadata)
 	g.owners.Touch(owner, tunnelID)
 	ip, _ := destinationAddrPort(metadata)
-	g.events.dnsBypass(owner, g.owners.SessionID(owner), tunnelID, canonicalizeIP(ip))
+	dst := canonicalizeIP(ip)
+	if dst == "" {
+		dst = destinationFQDN(metadata)
+	}
+	g.events.dnsBypass(owner, g.owners.SessionID(owner), tunnelID, dst)
 }
 
 func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (RouteAction, error) {
@@ -205,6 +227,10 @@ func destinationAddrPort(metadata adapter.InboundContext) (netip.Addr, uint16) {
 		return metadata.DestinationAddresses[0].Unmap(), metadata.Destination.Port
 	}
 	return netip.Addr{}, metadata.Destination.Port
+}
+
+func destinationFQDN(metadata adapter.InboundContext) string {
+	return normalizeDNSHost(metadata.Destination.Fqdn)
 }
 
 func (g *Guard) Close() error {

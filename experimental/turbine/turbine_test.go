@@ -62,6 +62,14 @@ func meta(user, ip string, port uint16) adapter.InboundContext {
 	}
 }
 
+func metaFQDN(user, host string, port uint16) adapter.InboundContext {
+	return adapter.InboundContext{
+		User:        user,
+		InboundType: C.TypeTUIC,
+		Destination: M.Socksaddr{Fqdn: host, Port: port},
+	}
+}
+
 func waitAllow(t *testing.T, g *Guard, user, app string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -292,6 +300,158 @@ func TestPublicDNSQueryIsBypass(t *testing.T) {
 	}
 	if g.isDNSBypass(meta("108", "10.7.76.121", 53)) {
 		t.Fatal("private :53 should not hijack")
+	}
+}
+
+const testHKSession = "sess_0ebb800b-2c10-4554-86ed-3abf92c3b815"
+
+func testHKGuard(resolverIPs ...string) *Guard {
+	if len(resolverIPs) == 0 {
+		resolverIPs = []string{"10.7.133.255:5353"}
+	}
+	return NewGuard(testLogger{}, option.TurbineOptions{
+		Enabled:          true,
+		HKDNSResolverIPs: resolverIPs,
+		Mock: &option.TurbineMockOptions{
+			Enabled:       true,
+			OwnerSessions: map[string]string{"4": testHKSession},
+		},
+	})
+}
+
+// Prod new-client log: inbound packet connection to ns1.hk.aerocore.com.cn:5353
+// then session.route action=proxy (not session.dns_bypass / dns_query).
+// Old radar clients send 10.7.133.255:5353 and hit dns_bypass.
+func TestNewClientHKDNSHostnameIsBypass(t *testing.T) {
+	g := testHKGuard()
+	defer g.Close()
+
+	oldClient := meta("4", "10.7.133.255", 5353)
+	oldClient.InboundType = C.TypeTUIC
+	if !g.isDNSBypass(oldClient) {
+		t.Fatal("old client IP dest 10.7.133.255:5353 should be dns bypass")
+	}
+
+	for _, host := range []string{"ns1.hk.aerocore.com.cn", "ns1.hk.dev.aerocore.com.cn"} {
+		if !g.isDNSBypass(metaFQDN("4", host, 5353)) {
+			t.Fatalf("%s:5353 should be dns bypass so EDNS session is injected", host)
+		}
+	}
+
+	newClient := metaFQDN("4", "ns1.hk.aerocore.com.cn", 5353)
+	cased := metaFQDN("4", "NS1.HK.AEROCORE.COM.CN.", 5353)
+	if !g.isDNSBypass(cased) {
+		t.Fatal("prod HK DNS FQDN match should be case-insensitive and ignore trailing dot")
+	}
+	if !g.isDNSBypass(metaFQDN("4", "NS1.HK.DEV.AEROCORE.COM.CN.", 5353)) {
+		t.Fatal("dev HK DNS FQDN match should be case-insensitive and ignore trailing dot")
+	}
+
+	resolved := metaFQDN("4", "ns1.hk.aerocore.com.cn", 5353)
+	resolved.DestinationAddresses = []netip.Addr{netip.MustParseAddr("1.2.3.4")}
+	if !g.isDNSBypass(resolved) {
+		t.Fatal("resolved FQDN ns1.hk.aerocore.com.cn:5353 should still bypass")
+	}
+
+	wrapped, err := g.RoutedPacketConnection(context.Background(), nil, &newClient, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edns, ok := wrapped.(*ednsPacketConn)
+	if !ok {
+		t.Fatalf("want edns wrapper for hostname DNS, got %T", wrapped)
+	}
+	wantRedirect := netip.MustParseAddrPort("10.7.133.255:5353")
+	if edns.redirect != wantRedirect {
+		t.Fatalf("want UDP redirect to %s, got %s", wantRedirect, edns.redirect)
+	}
+}
+
+func TestHKDNSHostnameRejectsLookalikes(t *testing.T) {
+	g := testHKGuard("10.0.0.53:53", "10.7.133.255:5353")
+	defer g.Close()
+
+	if g.isDNSBypass(metaFQDN("4", "ns1.hk.aerocore.com.cn", 443)) {
+		t.Fatal("FQDN on non-DNS port should not bypass")
+	}
+	if g.isDNSBypass(metaFQDN("4", "ns1.hk.dev.aerocore.com.cn", 443)) {
+		t.Fatal("dev FQDN on non-DNS port should not bypass")
+	}
+	if g.isDNSBypass(metaFQDN("4", "evil.example", 5353)) {
+		t.Fatal("arbitrary FQDN:5353 must not be treated as HK DNS")
+	}
+	if g.isDNSBypass(metaFQDN("4", "ns1.hk.aerocore.com.cn", 53)) {
+		t.Fatal("HK DNS hostname on :53 must not bypass")
+	}
+	if g.isDNSBypass(metaFQDN("4", "ns1.hk.dev.aerocore.com.cn", 53)) {
+		t.Fatal("dev HK DNS hostname on :53 must not bypass")
+	}
+	ipWithDomain := meta("4", "8.8.8.8", 5353)
+	ipWithDomain.InboundType = C.TypeTUIC
+	ipWithDomain.Domain = "ns1.hk.aerocore.com.cn"
+	if g.isDNSBypass(ipWithDomain) {
+		t.Fatal("IP destination must not bypass via metadata.Domain")
+	}
+}
+
+func TestHKDNSRedirectPrefersPort5353(t *testing.T) {
+	g := testHKGuard("1.1.1.1:53", "10.7.133.255:5353")
+	defer g.Close()
+	newClient := metaFQDN("4", "ns1.hk.aerocore.com.cn", 5353)
+	wrapped, err := g.RoutedPacketConnection(context.Background(), nil, &newClient, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edns, ok := wrapped.(*ednsPacketConn)
+	if !ok {
+		t.Fatalf("want edns wrapper, got %T", wrapped)
+	}
+	want := netip.MustParseAddrPort("10.7.133.255:5353")
+	if edns.redirect != want {
+		t.Fatalf("want redirect to 5353 resolver %s, got %s", want, edns.redirect)
+	}
+}
+
+func TestHKDNSTCPRewritesAndInjectsEDNS(t *testing.T) {
+	g := testHKGuard("1.1.1.1:53", "10.7.133.255:5353")
+	defer g.Close()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	m := metaFQDN("4", "ns1.hk.aerocore.com.cn", 5353)
+	wrapped, err := g.RoutedConnection(context.Background(), server, &m, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wrapped.(*ednsStreamConn); !ok {
+		t.Fatalf("want TCP EDNS wrapper, got %T", wrapped)
+	}
+	if m.Destination.Addr.Unmap().String() != "10.7.133.255" || m.Destination.Port != 5353 {
+		t.Fatalf("TCP dest=%s want 10.7.133.255:5353", m.Destination)
+	}
+
+	query := prependTCPDNSLengthPrefix(packDNSQuestion(t))
+	errc := make(chan error, 1)
+	go func() {
+		_, werr := client.Write(query)
+		errc <- werr
+	}()
+	buf := make([]byte, 2048)
+	n, rerr := wrapped.Read(buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if werr := <-errc; werr != nil {
+		t.Fatal(werr)
+	}
+	body, ok := stripTCPDNSLengthPrefix(buf[:n])
+	if !ok {
+		t.Fatalf("want TCP-framed DNS, got %x", buf[:n])
+	}
+	if !hasEDNSSession(body, 65001, testHKSession) {
+		t.Fatal("TCP DNS query missing EDNS session")
 	}
 }
 
