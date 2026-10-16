@@ -19,6 +19,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -662,6 +663,99 @@ func TestEDNSRedirectsPublicDNS(t *testing.T) {
 	}
 }
 
+func TestEDNSCachedPacketRewritesWithoutWaiterError(t *testing.T) {
+	raw := packDNSQuestion(t)
+	log := &captureLogger{}
+	events := newSessionLogger(log)
+	wait := &stubPacketReadWaiter{payload: raw}
+	inner := &waiterPacketConn{stubPacketConn: stubPacketConn{readPayload: raw}, wait: wait}
+	fqdn := M.Socksaddr{Fqdn: "ns1.hk.dev.aerocore.com.cn", Port: 5353}
+	first := buf.NewPacket()
+	if _, err := first.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	second := buf.NewPacket()
+	if _, err := second.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	cached := bufio.NewCachedPacketConn(inner, first, fqdn)
+	cached = bufio.NewCachedPacketConn(cached, second, fqdn)
+	redir := netip.MustParseAddrPort("10.7.133.255:5353")
+	wrapped := wrapEDNSPacketConn(cached, 65001, func() string { return "sess_abc" }, events, "108", "tun", redir)
+	edns := wrapped.(*ednsPacketConn)
+
+	var cachedPackets []*N.PacketBuffer
+	for {
+		packet := edns.ReadCachedPacket()
+		if packet == nil {
+			break
+		}
+		cachedPackets = append(cachedPackets, packet)
+	}
+	if len(cachedPackets) != 2 {
+		t.Fatalf("cached packets=%d", len(cachedPackets))
+	}
+	for _, packet := range cachedPackets {
+		if !hasEDNSSession(packet.Buffer.Bytes(), 65001, "sess_abc") {
+			t.Fatal("cached query missing session")
+		}
+		if packet.Destination.Addr.String() != "10.7.133.255" || packet.Destination.Port != 5353 {
+			t.Fatalf("cached dest=%s", packet.Destination)
+		}
+		packet.Buffer.Release()
+		N.PutPacketBuffer(packet)
+	}
+
+	readWaiter, ok := bufio.CreatePacketReadWaiter(wrapped)
+	if !ok {
+		t.Fatal("drained cache should expose the inner read waiter")
+	}
+	readWaiter.InitializeReadWaiter(N.ReadWaitOptions{})
+	buffer, dest, err := readWaiter.WaitReadPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buffer.Release()
+	if !hasEDNSSession(buffer.Bytes(), 65001, "sess_abc") {
+		t.Fatal("waited query missing session")
+	}
+	if dest.Addr.String() != "10.7.133.255" || dest.Port != 5353 {
+		t.Fatalf("wait dest=%s", dest)
+	}
+
+	resp := buf.NewPacket()
+	defer resp.Release()
+	if _, err := resp.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapped.WritePacket(resp, fqdn); err != nil {
+		t.Fatal(err)
+	}
+	joined := log.joined()
+	if strings.Contains(joined, "dns_error") || strings.Contains(joined, "invalid IP") {
+		t.Fatalf("unexpected log: %s", joined)
+	}
+	if !strings.Contains(joined, `"dst_ip":"10.7.133.255"`) {
+		t.Fatalf("query dst missing redirect ip: %s", joined)
+	}
+	if !strings.Contains(joined, `"dst_ip":"ns1.hk.dev.aerocore.com.cn"`) {
+		t.Fatalf("response dst missing hostname: %s", joined)
+	}
+}
+
+type waiterPacketConn struct {
+	stubPacketConn
+	wait *stubPacketReadWaiter
+}
+
+func (c *waiterPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) bool {
+	return c.wait.InitializeReadWaiter(options)
+}
+
+func (c *waiterPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
+	return c.wait.WaitReadPacket()
+}
+
 func TestReplaceBufferPayloadPreservesHeadroom(t *testing.T) {
 	raw := packDNSQuestion(t)
 	rewritten, ok := rewriteEDNSSession(raw, 65001, "sess_abc")
@@ -1031,6 +1125,12 @@ func (l *captureLogger) contains(substr string) bool {
 		}
 	}
 	return false
+}
+
+func (l *captureLogger) joined() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.msgs, "\n")
 }
 
 type flakyOwnerStore struct {

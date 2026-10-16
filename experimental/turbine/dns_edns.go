@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
@@ -290,12 +291,56 @@ func (c *ednsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr
 	return err
 }
 
+// ReadCachedPacket rewrites the route-layer cached first packet.
+// CopyPacket pulls CachedPacketReader before CreateReadWaiter. Without this,
+// the cache stays inside CachedPacketConn, that conn is not replaceable, and
+// the TUIC read waiter cannot be reached.
+func (c *ednsPacketConn) ReadCachedPacket() *N.PacketBuffer {
+	packet := nextCachedPacket(N.PacketReader(c.PacketConn))
+	if packet == nil {
+		return nil
+	}
+	packet.Buffer = c.rewriteQuery(packet.Buffer, packet.Destination, true)
+	packet.Destination = c.redirectDest(packet.Destination)
+	return packet
+}
+
+func nextCachedPacket(reader N.PacketReader) *N.PacketBuffer {
+	for range 8 {
+		cachedReader, ok := reader.(N.CachedPacketReader)
+		if !ok {
+			return nil
+		}
+		packet := cachedReader.ReadCachedPacket()
+		if packet != nil && packet.Buffer != nil {
+			return packet
+		}
+		if packet != nil {
+			N.PutPacketBuffer(packet)
+		}
+		replaceable, ok := reader.(N.ReaderWithUpstream)
+		if !ok || !replaceable.ReaderReplaceable() {
+			return nil
+		}
+		upstream, ok := reader.(common.WithUpstream)
+		if !ok {
+			return nil
+		}
+		next, ok := upstream.Upstream().(N.PacketReader)
+		if !ok {
+			return nil
+		}
+		reader = next
+	}
+	return nil
+}
+
 func (c *ednsPacketConn) CreateReadWaiter() (N.PacketReadWaiter, bool) {
+	// CachedPacketConn is not replaceable until its packet is taken, and some
+	// inbounds have no packet read waiter. CopyPacket then uses ReadPacket,
+	// which still rewrites. That fallback is not a DNS failure.
 	readWaiter, ok := bufio.CreatePacketReadWaiter(c.PacketConn)
 	if !ok {
-		if c.events != nil {
-			c.events.dnsError(c.owner, c.sessionID(), c.tunnelID, "", "wait_reader", "unavailable_fallback_readpacket")
-		}
 		return nil, false
 	}
 	return &ednsPacketReadWaiter{conn: c, readWaiter: readWaiter}, true
@@ -340,7 +385,7 @@ func (c *ednsPacketConn) rewriteQuery(buffer *buf.Buffer, destination M.Socksadd
 	payload := buffer.Bytes()
 	bytesIn := len(payload)
 	headroom := buffer.Start()
-	dstIP := destination.Addr.Unmap().String()
+	dstIP := packetEndpoint(c.redirectDest(destination))
 
 	dnsMsg := payload
 	framed := false
@@ -397,7 +442,7 @@ func (c *ednsPacketConn) logResponse(buffer *buf.Buffer, destination M.Socksaddr
 	}
 	payload := buffer.Bytes()
 	qname, qtype, rcode := dnsQuestionMeta(payload)
-	dstIP := destination.Addr.Unmap().String()
+	dstIP := packetEndpoint(destination)
 	hexStr := ""
 	if len(payload) <= 32 || rcode != 0 {
 		hexStr = payloadHex(payload)
@@ -409,11 +454,16 @@ func (c *ednsPacketConn) logError(destination M.Socksaddr, direction string, err
 	if c.events == nil || err == nil || isBenignPacketErr(err) {
 		return
 	}
-	dstIP := ""
-	if destination.IsValid() {
-		dstIP = destination.Addr.Unmap().String()
+	c.events.dnsError(c.owner, c.sessionID(), c.tunnelID, packetEndpoint(destination), direction, err.Error())
+}
+
+// packetEndpoint is the address operators should see. A domain-only Socksaddr
+// has an invalid Addr, whose String is "invalid IP".
+func packetEndpoint(destination M.Socksaddr) string {
+	if destination.Addr.IsValid() {
+		return destination.Addr.Unmap().String()
 	}
-	c.events.dnsError(c.owner, c.sessionID(), c.tunnelID, dstIP, direction, err.Error())
+	return destination.Fqdn
 }
 
 func isBenignPacketErr(err error) bool {
