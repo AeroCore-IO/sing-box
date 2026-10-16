@@ -1132,7 +1132,7 @@ func TestDecisionFailKeepsSnapshot(t *testing.T) {
 	store := &flakyDecisionStore{Store: base}
 	cache := newDecisionCache(testLogger{}, store, time.Minute, 30*time.Second, 5*time.Second, 0.70)
 	ip := netip.MustParseAddr("1.2.3.4")
-	d, band := cache.Lookup(context.Background(), ip)
+	d, band := cache.Lookup(context.Background(), ip, nil)
 	if d == nil || band != BandHigh {
 		t.Fatalf("want HIGH, got %#v band=%v", d, band)
 	}
@@ -1143,7 +1143,7 @@ func TestDecisionFailKeepsSnapshot(t *testing.T) {
 	cache.cache["1.2.3.4"] = e
 	cache.mu.Unlock()
 	store.fail = true
-	d2, band2 := cache.Lookup(context.Background(), ip)
+	d2, band2 := cache.Lookup(context.Background(), ip, nil)
 	if d2 == nil || band2 != BandHigh || d2.SteamAppID != "1086940" {
 		t.Fatalf("want stale HIGH kept, got %#v band=%v", d2, band2)
 	}
@@ -1270,6 +1270,90 @@ func TestDestIndexSkipIP(t *testing.T) {
 	action, err = g.evaluate(context.Background(), meta("108", "5.45.187.118", 5055))
 	if err != nil || action != ActionAcceleration {
 		t.Fatalf("cidr dest want acceleration, got %s err=%v", action, err)
+	}
+}
+
+func TestFullTunnelCIDRUsesSessionGame(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"108": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "108", SteamAppIDs: []string{"761890"}},
+		},
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{{
+				CIDR:        "0.0.0.0/0",
+				SteamAppID:  "1364780",
+				SteamAppIDs: []string{"1364780", "761890", "2524890"},
+				Confidence:  1,
+				Priority:    10,
+			}},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "108", "761890")
+	action, err := g.evaluate(context.Background(), meta("108", "154.81.15.20", 4433))
+	if err != nil || action != ActionAcceleration {
+		t.Fatalf("full tunnel want acceleration, got %s err=%v", action, err)
+	}
+}
+
+func TestEqualPriorityCIDRDoesNotBorrowFullTunnelGame(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"108": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "108", SteamAppIDs: []string{"761890"}},
+		},
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{
+				{CIDR: "154.81.15.0/24", SteamAppID: "1364780", Confidence: 1, Priority: 10},
+				{
+					CIDR:        "0.0.0.0/0",
+					SteamAppIDs: []string{"1364780", "761890"},
+					Confidence:  1,
+					Priority:    10,
+				},
+			},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "108", "761890")
+	action, err := g.evaluate(context.Background(), meta("108", "154.81.15.20", 4433))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("equal priority must not borrow full tunnel, got %s err=%v", action, err)
+	}
+}
+
+func TestHigherPriorityCIDRBeatsFullTunnel(t *testing.T) {
+	g := testGuard(&option.TurbineMockOptions{
+		Enabled:       true,
+		OwnerSessions: map[string]string{"108": "sess1"},
+		Allows: map[string]option.TurbineMockAllow{
+			"sess1": {Owner: "108", SteamAppIDs: []string{"761890"}},
+		},
+		DestIndex: &option.TurbineMockDestIndex{
+			CIDRs: []option.TurbineMockDestCIDR{
+				{
+					CIDR:        "0.0.0.0/0",
+					SteamAppIDs: []string{"761890"},
+					Confidence:  1,
+					Priority:    10,
+				},
+				{
+					CIDR:       "154.81.15.0/24",
+					SteamAppID: "1364780",
+					Confidence: 1,
+					Priority:   20,
+				},
+			},
+		},
+	})
+	defer g.Close()
+	waitAllow(t, g, "108", "761890")
+	action, err := g.evaluate(context.Background(), meta("108", "154.81.15.20", 4433))
+	if err != nil || action != ActionProxy {
+		t.Fatalf("specific cidr want proxy, got %s err=%v", action, err)
 	}
 }
 

@@ -186,7 +186,11 @@ func (g *Guard) evaluate(ctx context.Context, metadata adapter.InboundContext) (
 		return ActionRejected, rejected()
 	}
 
-	decision, band := g.decisions.Lookup(ctx, ip)
+	var allow func(string) bool
+	if !legacy {
+		allow = st.inAllow
+	}
+	decision, band := g.decisions.Lookup(ctx, ip, allow)
 	var steamAppID string
 	var confidence float64
 	if decision != nil {

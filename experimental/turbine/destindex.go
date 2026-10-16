@@ -24,15 +24,17 @@ func (d *DestIndex) compile() {
 			continue
 		}
 		d.cidrNets = append(d.cidrNets, destNet{
-			network:    network,
-			steamAppID: c.SteamAppID,
-			confidence: c.Confidence,
-			priority:   c.Priority,
+			network:     network,
+			steamAppID:  c.SteamAppID,
+			steamAppIDs: append([]string(nil), c.SteamAppIDs...),
+			confidence:  c.Confidence,
+			priority:    c.Priority,
 		})
 	}
 }
 
-func (d *DestIndex) lookup(ip netip.Addr) *IPDecision {
+// lookup matches ip. allow, when set, selects that game from a shared Full Tunnel CIDR.
+func (d *DestIndex) lookup(ip netip.Addr, allow func(string) bool) *IPDecision {
 	if d == nil || !ip.IsValid() {
 		return nil
 	}
@@ -58,8 +60,38 @@ func (d *DestIndex) lookup(ip netip.Addr) *IPDecision {
 			found = true
 		}
 	}
-	if !found || best.steamAppID == "" {
+	if !found {
 		return nil
 	}
-	return &IPDecision{IP: canon, SteamAppID: best.steamAppID, Confidence: best.confidence}
+	id := chooseDestApp(destAppIDs(best.steamAppIDs, best.steamAppID), allow)
+	if id == "" {
+		return nil
+	}
+	return &IPDecision{IP: canon, SteamAppID: id, Confidence: best.confidence}
+}
+
+func destAppIDs(ids []string, single string) []string {
+	if len(ids) > 0 {
+		return ids
+	}
+	if single != "" {
+		return []string{single}
+	}
+	return nil
+}
+
+func chooseDestApp(ids []string, allow func(string) bool) string {
+	if allow != nil {
+		for _, id := range ids {
+			if id != "" && allow(id) {
+				return id
+			}
+		}
+	}
+	for _, id := range ids {
+		if id != "" {
+			return id
+		}
+	}
+	return ""
 }

@@ -54,10 +54,11 @@ type TurbineMockDestHit struct {
 }
 
 type TurbineMockDestCIDR struct {
-	CIDR       string  `json:"cidr,omitempty"`
-	SteamAppID string  `json:"steam_app_id,omitempty"`
-	Confidence float64 `json:"confidence,omitempty"`
-	Priority   int     `json:"priority,omitempty"`
+	CIDR        string   `json:"cidr,omitempty"`
+	SteamAppID  string   `json:"steam_app_id,omitempty"`
+	SteamAppIDs []string `json:"steam_app_ids,omitempty"`
+	Confidence  float64  `json:"confidence,omitempty"`
+	Priority    int      `json:"priority,omitempty"`
 }
 
 type TurbineMockAllow struct {

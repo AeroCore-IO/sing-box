@@ -60,7 +60,8 @@ func newMockStore(options *option.TurbineMockOptions) *mockStore {
 		}
 		for _, c := range options.DestIndex.CIDRs {
 			s.dest.CIDRs = append(s.dest.CIDRs, DestCIDR{
-				CIDR: c.CIDR, SteamAppID: c.SteamAppID, Confidence: c.Confidence, Priority: c.Priority,
+				CIDR: c.CIDR, SteamAppID: c.SteamAppID, SteamAppIDs: append([]string(nil), c.SteamAppIDs...),
+				Confidence: c.Confidence, Priority: c.Priority,
 			})
 		}
 		s.dest.SkipIPs = append([]string(nil), options.DestIndex.SkipIPs...)

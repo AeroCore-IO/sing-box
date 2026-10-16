@@ -22,22 +22,25 @@ type IPDecision struct {
 }
 
 type DestHit struct {
-	SteamAppID string  `json:"steam_app_id"`
-	Confidence float64 `json:"confidence"`
+	SteamAppID  string   `json:"steam_app_id"`
+	SteamAppIDs []string `json:"steam_app_ids,omitempty"`
+	Confidence  float64  `json:"confidence"`
 }
 
 type DestCIDR struct {
-	CIDR       string  `json:"cidr"`
-	SteamAppID string  `json:"steam_app_id"`
-	Confidence float64 `json:"confidence"`
-	Priority   int     `json:"priority"`
+	CIDR        string   `json:"cidr"`
+	SteamAppID  string   `json:"steam_app_id"`
+	SteamAppIDs []string `json:"steam_app_ids,omitempty"`
+	Confidence  float64  `json:"confidence"`
+	Priority    int      `json:"priority"`
 }
 
 type destNet struct {
-	network    *net.IPNet
-	steamAppID string
-	confidence float64
-	priority   int
+	network     *net.IPNet
+	steamAppID  string
+	steamAppIDs []string
+	confidence  float64
+	priority    int
 }
 
 // DestIndex is Redis wl:dest. Exact IPs take precedence over CIDRs.
