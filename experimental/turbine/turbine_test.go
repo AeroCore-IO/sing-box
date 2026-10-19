@@ -788,6 +788,60 @@ func TestEDNSCachedPacketRewritesWithoutWaiterError(t *testing.T) {
 	}
 }
 
+func TestEDNSCreateReadWaiterFallsBackWithoutError(t *testing.T) {
+	raw := packDNSQuestion(t)
+	log := &captureLogger{}
+	events := newSessionLogger(log)
+	inner := &stubPacketConn{readPayload: raw}
+	fqdn := M.Socksaddr{Fqdn: "ns1.hk.dev.aerocore.com.cn", Port: 5353}
+	first := buf.NewPacket()
+	if _, err := first.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	cached := bufio.NewCachedPacketConn(inner, first, fqdn)
+	redir := netip.MustParseAddrPort("10.7.133.255:5353")
+	wrapped := wrapEDNSPacketConn(cached, 65001, func() string { return "sess_abc" }, events, "radar", "10.13.86.148:22619", redir)
+
+	readWaiter, ok := bufio.CreatePacketReadWaiter(wrapped)
+	if !ok {
+		t.Fatal("CreateReadWaiter must not fail when the inner waiter is unavailable")
+	}
+	if readWaiter.InitializeReadWaiter(N.ReadWaitOptions{}) {
+		t.Fatal("fallback waiter should not require an extra copy")
+	}
+	buffer, dest, err := readWaiter.WaitReadPacket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buffer.Release()
+	if !hasEDNSSession(buffer.Bytes(), 65001, "sess_abc") {
+		t.Fatal("fallback waiter query missing session")
+	}
+	if dest.Addr.String() != "10.7.133.255" || dest.Port != 5353 {
+		t.Fatalf("fallback dest=%s", dest)
+	}
+	joined := log.joined()
+	if strings.Contains(joined, "dns_error") || strings.Contains(joined, "unavailable_fallback_readpacket") {
+		t.Fatalf("waiter fallback logged as dns_error: %s", joined)
+	}
+}
+
+func TestDNSErrorSkipsWaiterFallback(t *testing.T) {
+	log := &captureLogger{}
+	events := newSessionLogger(log)
+	for range 9 {
+		events.dnsError("radar", "", "10.13.86.148:22619", "", "wait_reader", "unavailable_fallback_readpacket")
+	}
+	events.dnsError("radar", "", "10.13.86.148:22619", "", "write", "i/o timeout")
+	joined := log.joined()
+	if strings.Contains(joined, "unavailable_fallback_readpacket") || strings.Contains(joined, "wait_reader") {
+		t.Fatalf("waiter fallback must not emit dns_error: %s", joined)
+	}
+	if strings.Count(joined, `"event":"session.dns_error"`) != 1 || !strings.Contains(joined, "i/o timeout") {
+		t.Fatalf("real write errors should still emit: %s", joined)
+	}
+}
+
 type waiterPacketConn struct {
 	stubPacketConn
 	wait *stubPacketReadWaiter

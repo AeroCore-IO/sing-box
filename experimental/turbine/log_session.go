@@ -133,6 +133,10 @@ func (l *sessionLogger) dnsResponse(owner, sessionID, tunnelID, dstIP, qname, qt
 }
 
 func (l *sessionLogger) dnsError(owner, sessionID, tunnelID, dstIP, direction, reason string) {
+	// CreateReadWaiter falling back to ReadPacket is not a DNS failure.
+	if direction == "wait_reader" && reason == "unavailable_fallback_readpacket" {
+		return
+	}
 	l.emit(sessionEvent{
 		Event:     "session.dns_error",
 		Owner:     owner,

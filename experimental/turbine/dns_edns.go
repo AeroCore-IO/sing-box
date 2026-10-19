@@ -336,14 +336,37 @@ func nextCachedPacket(reader N.PacketReader) *N.PacketBuffer {
 }
 
 func (c *ednsPacketConn) CreateReadWaiter() (N.PacketReadWaiter, bool) {
+	// Always return a waiter so CopyPacket keeps EDNS rear headroom.
 	// CachedPacketConn is not replaceable until its packet is taken, and some
-	// inbounds have no packet read waiter. CopyPacket then uses ReadPacket,
-	// which still rewrites. That fallback is not a DNS failure.
+	// inbounds have no packet read waiter. Falling back to ReadPacket is not a
+	// DNS failure — do not emit session.dns_error for it.
 	readWaiter, ok := bufio.CreatePacketReadWaiter(c.PacketConn)
 	if !ok {
-		return nil, false
+		readWaiter = &packetConnReadWaiter{conn: c.PacketConn}
 	}
 	return &ednsPacketReadWaiter{conn: c, readWaiter: readWaiter}, true
+}
+
+// packetConnReadWaiter is used when the inner conn has no zero-copy waiter.
+type packetConnReadWaiter struct {
+	conn    N.PacketConn
+	options N.ReadWaitOptions
+}
+
+func (w *packetConnReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	w.options = options
+	return false
+}
+
+func (w *packetConnReadWaiter) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	buffer = w.options.NewPacketBuffer()
+	destination, err = w.conn.ReadPacket(buffer)
+	if err != nil {
+		buffer.Release()
+		return nil, destination, err
+	}
+	w.options.PostReturn(buffer)
+	return buffer, destination, nil
 }
 
 type ednsPacketReadWaiter struct {
