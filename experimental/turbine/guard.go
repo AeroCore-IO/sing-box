@@ -96,7 +96,7 @@ func (g *Guard) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, m
 		return conn, nil
 	}
 	if g.isDNSBypass(*metadata) {
-		return g.wrapDNSBypassUDP(conn, *metadata), nil
+		return g.wrapDNSBypassUDP(conn, metadata), nil
 	}
 	if _, err := g.evaluate(ctx, *metadata); err != nil {
 		return conn, err
@@ -138,13 +138,23 @@ func (g *Guard) dnsBypassTCP(metadata *adapter.InboundContext) error {
 	return nil
 }
 
-func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata adapter.InboundContext) N.PacketConn {
+// wrapDNSBypassUDP injects EDNS session and, for domain destinations, rewrites
+// metadata.Destination to the HK resolver IP so ListenPacket skips
+// resolveDialer.Lookup (avoids "lookup ns1.hk…: context canceled").
+// redirect is computed before the rewrite so cached/association packets that
+// still carry the FQDN keep being remapped.
+func (g *Guard) wrapDNSBypassUDP(conn N.PacketConn, metadata *adapter.InboundContext) N.PacketConn {
 	owner := metadata.User
-	tunnelID := tunnelIDFrom(metadata)
-	g.logDNSBypass(metadata)
+	tunnelID := tunnelIDFrom(*metadata)
+	g.logDNSBypass(*metadata)
+	redirect := g.dnsRewriteTarget(*metadata)
+	if redirect.IsValid() && metadata.Destination.IsDomain() {
+		metadata.Destination = M.SocksaddrFrom(redirect.Addr(), redirect.Port())
+		metadata.DestinationAddresses = nil
+	}
 	return wrapEDNSPacketConn(conn, g.ednsCode, func() string {
 		return g.owners.SessionID(owner)
-	}, g.events, owner, tunnelID, g.dnsRewriteTarget(metadata))
+	}, g.events, owner, tunnelID, redirect)
 }
 
 // dnsRewriteTarget is the HK DNS AddrPort to hijack toward, or invalid if the

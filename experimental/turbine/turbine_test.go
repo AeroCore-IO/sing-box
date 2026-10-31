@@ -366,6 +366,78 @@ func TestNewClientHKDNSHostnameIsBypass(t *testing.T) {
 	if edns.redirect != wantRedirect {
 		t.Fatalf("want UDP redirect to %s, got %s", wantRedirect, edns.redirect)
 	}
+	if newClient.Destination.Addr.Unmap().String() != "10.7.133.255" || newClient.Destination.Port != 5353 {
+		t.Fatalf("UDP FQDN dest should rewrite to resolver IP, got %s", newClient.Destination)
+	}
+	if newClient.Destination.IsDomain() {
+		t.Fatal("UDP FQDN dest must not remain a domain after bypass (ListenPacket would Lookup)")
+	}
+	if len(newClient.DestinationAddresses) != 0 {
+		t.Fatalf("DestinationAddresses should be cleared, got %v", newClient.DestinationAddresses)
+	}
+}
+
+func TestHKDNSUDPRewritesDomainKeepsRedirect(t *testing.T) {
+	g := testHKGuard("1.1.1.1:53", "10.7.133.255:5353")
+	defer g.Close()
+	want := netip.MustParseAddrPort("10.7.133.255:5353")
+
+	fqdn := metaFQDN("4", "ns1.hk.aerocore.com.cn", 5353)
+	fqdn.DestinationAddresses = []netip.Addr{netip.MustParseAddr("1.2.3.4")}
+	wrapped, err := g.RoutedPacketConnection(context.Background(), nil, &fqdn, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edns, ok := wrapped.(*ednsPacketConn)
+	if !ok {
+		t.Fatalf("want edns wrapper, got %T", wrapped)
+	}
+	if edns.redirect != want {
+		t.Fatalf("redirect=%s want %s (must keep redirect after Destination rewrite)", edns.redirect, want)
+	}
+	if fqdn.Destination.Addr.Unmap().String() != "10.7.133.255" || fqdn.Destination.Port != 5353 {
+		t.Fatalf("dest=%s want %s", fqdn.Destination, want)
+	}
+	if len(fqdn.DestinationAddresses) != 0 {
+		t.Fatalf("stale DestinationAddresses=%v", fqdn.DestinationAddresses)
+	}
+
+	pinned := meta("4", "10.7.133.255", 5353)
+	pinned.InboundType = C.TypeTUIC
+	wrapped, err = g.RoutedPacketConnection(context.Background(), nil, &pinned, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edns, ok = wrapped.(*ednsPacketConn)
+	if !ok {
+		t.Fatalf("want edns wrapper for pinned IP, got %T", wrapped)
+	}
+	if edns.redirect.IsValid() {
+		t.Fatalf("pinned resolver should have empty redirect, got %s", edns.redirect)
+	}
+	if pinned.Destination.Addr.Unmap().String() != "10.7.133.255" || pinned.Destination.Port != 5353 {
+		t.Fatalf("pinned dest changed: %s", pinned.Destination)
+	}
+
+	// 8.8.8.8 is public DNS (not in HKDNSResolverIPs); IP dest must stay,
+	// while packet redirect still points at the HK resolver.
+	public := meta("4", "8.8.8.8", 53)
+	public.InboundType = C.TypeTUIC
+	wrapped, err = g.RoutedPacketConnection(context.Background(), nil, &public, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edns, ok = wrapped.(*ednsPacketConn)
+	if !ok {
+		t.Fatalf("want edns wrapper for public DNS, got %T", wrapped)
+	}
+	if public.Destination.Addr.Unmap().String() != "8.8.8.8" || public.Destination.Port != 53 {
+		t.Fatalf("public DNS IP dest must stay 8.8.8.8:53, got %s", public.Destination)
+	}
+	publicRedirect := netip.MustParseAddrPort("1.1.1.1:53") // firstDNSRedirect of this guard
+	if edns.redirect != publicRedirect {
+		t.Fatalf("public DNS redirect=%s want %s", edns.redirect, publicRedirect)
+	}
 }
 
 func TestHKDNSHostnameRejectsLookalikes(t *testing.T) {
@@ -410,6 +482,9 @@ func TestHKDNSRedirectPrefersPort5353(t *testing.T) {
 	want := netip.MustParseAddrPort("10.7.133.255:5353")
 	if edns.redirect != want {
 		t.Fatalf("want redirect to 5353 resolver %s, got %s", want, edns.redirect)
+	}
+	if newClient.Destination.Addr.Unmap().String() != "10.7.133.255" || newClient.Destination.Port != 5353 {
+		t.Fatalf("UDP dest=%s want %s", newClient.Destination, want)
 	}
 }
 
