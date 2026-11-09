@@ -33,7 +33,7 @@ func (d *DestIndex) compile() {
 	}
 }
 
-// lookup matches ip. allow, when set, selects that game from a shared Full Tunnel CIDR.
+// lookup matches ip. allow, when set, selects that game from a shared exact IP or CIDR.
 func (d *DestIndex) lookup(ip netip.Addr, allow func(string) bool) *IPDecision {
 	if d == nil || !ip.IsValid() {
 		return nil
@@ -42,12 +42,23 @@ func (d *DestIndex) lookup(ip netip.Addr, allow func(string) bool) *IPDecision {
 	if _, skip := d.skip[canon]; skip {
 		return nil
 	}
-	if hit, ok := d.IPs[canon]; ok && hit.SteamAppID != "" {
-		return &IPDecision{IP: canon, SteamAppID: hit.SteamAppID, Confidence: hit.Confidence}
+	if hit, ok := d.IPs[canon]; ok {
+		if apps := destAppIDs(hit.SteamAppIDs, hit.SteamAppID); len(apps) > 0 {
+			return ipDecisionFromApps(canon, apps, hit.Confidence, allow)
+		}
+		// Empty exact entry must not block a covering CIDR.
 	}
+	best, ok := d.bestCIDR(canon)
+	if !ok {
+		return nil
+	}
+	return ipDecisionFromApps(canon, destAppIDs(best.steamAppIDs, best.steamAppID), best.confidence, allow)
+}
+
+func (d *DestIndex) bestCIDR(canon string) (destNet, bool) {
 	parsed := net.ParseIP(canon)
 	if parsed == nil {
-		return nil
+		return destNet{}, false
 	}
 	var best destNet
 	found := false
@@ -60,14 +71,15 @@ func (d *DestIndex) lookup(ip netip.Addr, allow func(string) bool) *IPDecision {
 			found = true
 		}
 	}
-	if !found {
-		return nil
-	}
-	id := chooseDestApp(destAppIDs(best.steamAppIDs, best.steamAppID), allow)
+	return best, found
+}
+
+func ipDecisionFromApps(ip string, apps []string, confidence float64, allow func(string) bool) *IPDecision {
+	id := chooseDestApp(apps, allow)
 	if id == "" {
 		return nil
 	}
-	return &IPDecision{IP: canon, SteamAppID: id, Confidence: best.confidence}
+	return &IPDecision{IP: ip, SteamAppID: id, Confidence: confidence}
 }
 
 func destAppIDs(ids []string, single string) []string {
@@ -87,6 +99,7 @@ func chooseDestApp(ids []string, allow func(string) bool) string {
 				return id
 			}
 		}
+		return ""
 	}
 	for _, id := range ids {
 		if id != "" {

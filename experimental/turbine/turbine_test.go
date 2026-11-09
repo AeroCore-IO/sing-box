@@ -1402,28 +1402,56 @@ func TestDestIndexSkipIP(t *testing.T) {
 	}
 }
 
-func TestFullTunnelCIDRUsesSessionGame(t *testing.T) {
-	g := testGuard(&option.TurbineMockOptions{
-		Enabled:       true,
-		OwnerSessions: map[string]string{"108": "sess1"},
-		Allows: map[string]option.TurbineMockAllow{
-			"sess1": {Owner: "108", SteamAppIDs: []string{"761890"}},
+func TestDestIndexAllowSelect(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		dest *option.TurbineMockDestIndex
+	}{
+		{
+			name: "full tunnel cidr",
+			ip:   "154.81.15.20",
+			dest: &option.TurbineMockDestIndex{
+				CIDRs: []option.TurbineMockDestCIDR{{
+					CIDR:        "0.0.0.0/0",
+					SteamAppID:  "1364780",
+					SteamAppIDs: []string{"1364780", "761890", "2524890"},
+					Confidence:  1,
+					Priority:    10,
+				}},
+			},
 		},
-		DestIndex: &option.TurbineMockDestIndex{
-			CIDRs: []option.TurbineMockDestCIDR{{
-				CIDR:        "0.0.0.0/0",
-				SteamAppID:  "1364780",
-				SteamAppIDs: []string{"1364780", "761890", "2524890"},
-				Confidence:  1,
-				Priority:    10,
-			}},
+		{
+			name: "shared exact ip",
+			ip:   "45.67.211.180",
+			dest: &option.TurbineMockDestIndex{
+				IPs: map[string]option.TurbineMockDestHit{
+					"45.67.211.180": {
+						SteamAppID:  "553850",
+						SteamAppIDs: []string{"553850", "2524890", "761890"},
+						Confidence:  1,
+					},
+				},
+			},
 		},
-	})
-	defer g.Close()
-	waitAllow(t, g, "108", "761890")
-	action, err := g.evaluate(context.Background(), meta("108", "154.81.15.20", 4433))
-	if err != nil || action != ActionAcceleration {
-		t.Fatalf("full tunnel want acceleration, got %s err=%v", action, err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := testGuard(&option.TurbineMockOptions{
+				Enabled:       true,
+				OwnerSessions: map[string]string{"108": "sess1"},
+				Allows: map[string]option.TurbineMockAllow{
+					"sess1": {Owner: "108", SteamAppIDs: []string{"761890"}},
+				},
+				DestIndex: tt.dest,
+			})
+			defer g.Close()
+			waitAllow(t, g, "108", "761890")
+			action, err := g.evaluate(context.Background(), meta("108", tt.ip, 4433))
+			if err != nil || action != ActionAcceleration {
+				t.Fatalf("want acceleration, got %s err=%v", action, err)
+			}
+		})
 	}
 }
 

@@ -56,7 +56,11 @@ func newMockStore(options *option.TurbineMockOptions) *mockStore {
 	if options.DestIndex != nil {
 		s.dest.IPs = make(map[string]DestHit, len(options.DestIndex.IPs))
 		for ip, hit := range options.DestIndex.IPs {
-			s.dest.IPs[ip] = DestHit{SteamAppID: hit.SteamAppID, Confidence: hit.Confidence}
+			s.dest.IPs[ip] = DestHit{
+				SteamAppID:  hit.SteamAppID,
+				SteamAppIDs: append([]string(nil), hit.SteamAppIDs...),
+				Confidence:  hit.Confidence,
+			}
 		}
 		for _, c := range options.DestIndex.CIDRs {
 			s.dest.CIDRs = append(s.dest.CIDRs, DestCIDR{

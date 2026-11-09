@@ -49,8 +49,9 @@ type TurbineMockDestIndex struct {
 }
 
 type TurbineMockDestHit struct {
-	SteamAppID string  `json:"steam_app_id,omitempty"`
-	Confidence float64 `json:"confidence,omitempty"`
+	SteamAppID  string   `json:"steam_app_id,omitempty"`
+	SteamAppIDs []string `json:"steam_app_ids,omitempty"`
+	Confidence  float64  `json:"confidence,omitempty"`
 }
 
 type TurbineMockDestCIDR struct {
